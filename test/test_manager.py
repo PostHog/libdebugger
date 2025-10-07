@@ -16,25 +16,30 @@ def function_a(n):
     b = 14
     return a + b + n
 
+
 def function_b(n):
     a = 12
     b = 14
     return a + b + n
+
 
 def function_c(n):
     a = 12
     b = 14
     return a + b + n
 
+
 def function_d(n):
     a = 12
     b = 14
     return a + b + n
 
+
 def function_e(n):
     a = 12
     b = 14
     return a + b + n
+
 
 FUNCTION_POOL = [
     function_a,
@@ -44,14 +49,16 @@ FUNCTION_POOL = [
     function_e,
 ]
 
+
 def get_lineno_of_function(f):
     return f.__code__.co_firstlineno
+
 
 def function_is_instrumented(f):
     bc = Bytecode.from_code(f.__code__)
 
     for instr in bc:
-        if instr.name == 'LOAD_GLOBAL':
+        if instr.name == "LOAD_GLOBAL":
             if instr.arg == (True, "__posthog_ykwdzsgtgp_breakpoint_handler"):
                 return True
             elif instr.arg == "__posthog_ykwdzsgtgp_breakpoint_handler":
@@ -74,10 +81,16 @@ def breakpoint_strategy(draw):
 
 
 class TestManager(unittest.TestCase):
-    @given(breakpoints_over_time=st.lists(st.lists(breakpoint_strategy(), max_size=5), max_size=5))
+    @given(
+        breakpoints_over_time=st.lists(
+            st.lists(breakpoint_strategy(), max_size=5), max_size=5
+        )
+    )
     @settings(deadline=None)
     @patch("libdebugger.instrumentation._enqueue_message")
-    def test_update_breakpoints(self, enqueue_mock, *, breakpoints_over_time: List[List[Breakpoint]]):
+    def test_update_breakpoints(
+        self, enqueue_mock, *, breakpoints_over_time: List[List[Breakpoint]]
+    ):
         """
         == Property 1 ==
 
@@ -119,12 +132,20 @@ class TestManager(unittest.TestCase):
                 expected_enqueue_calls_per_func[fun] += 1
                 expected_instrumented_func_set.add(fun)
 
-            expected_non_instrumented_func_set = func_pool_set - expected_instrumented_func_set
+            expected_non_instrumented_func_set = (
+                func_pool_set - expected_instrumented_func_set
+            )
 
-            instrumented_func_set = {f for f in FUNCTION_POOL if function_is_instrumented(f)}
-            non_instrumented_func_set = {f for f in FUNCTION_POOL if not function_is_instrumented(f)}
+            instrumented_func_set = {
+                f for f in FUNCTION_POOL if function_is_instrumented(f)
+            }
+            non_instrumented_func_set = {
+                f for f in FUNCTION_POOL if not function_is_instrumented(f)
+            }
 
-            assert func_pool_set == instrumented_func_set.union(non_instrumented_func_set)
+            assert func_pool_set == instrumented_func_set.union(
+                non_instrumented_func_set
+            )
             assert not instrumented_func_set.intersection(non_instrumented_func_set)
 
             # Main checks for property #1

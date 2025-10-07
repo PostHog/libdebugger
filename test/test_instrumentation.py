@@ -3,10 +3,8 @@ from unittest.mock import patch
 from bytecode import Bytecode
 from hypothesis import given, strategies as st, settings
 
-from libdebugger.instrumentation import (
-    instrument_function_at_line,
-    reset_function
-)
+from libdebugger.instrumentation import instrument_function_at_line, reset_function
+
 
 def structural_test_function(x, y=5, *args, **kwargs):
     result = 0
@@ -146,6 +144,7 @@ def structural_test_function(x, y=5, *args, **kwargs):
     def make_adder(n):
         def adder(x):
             return x + n
+
         return adder
 
     add_five = make_adder(5)
@@ -184,16 +183,28 @@ def with_closure():
 
 
 class TestInsturmentation(unittest.TestCase):
-    @given(st.lists(st.integers(min_value=10, max_value=157)), st.integers(), st.integers(), st.tuples(st.integers()), st.booleans())
+    @given(
+        st.lists(st.integers(min_value=10, max_value=157)),
+        st.integers(),
+        st.integers(),
+        st.tuples(st.integers()),
+        st.booleans(),
+    )
     @settings(deadline=None)
     def test_instrumenting(self, linenos, arg_x, arg_y, arg_args, arg_flag):
-        expected_result = structural_test_function(arg_x, arg_y, *arg_args, flag=arg_flag)
+        expected_result = structural_test_function(
+            arg_x, arg_y, *arg_args, flag=arg_flag
+        )
 
         for lineno in linenos:
             instrument_function_at_line(structural_test_function, 0, lineno)
         assert instrumentation_present(structural_test_function)
-        instrumented_result = structural_test_function(arg_x, arg_y, *arg_args, **{"flag": arg_flag})
-        assert expected_result == instrumented_result, f"Result is not equal when instrumenting line {lineno}"
+        instrumented_result = structural_test_function(
+            arg_x, arg_y, *arg_args, **{"flag": arg_flag}
+        )
+        assert expected_result == instrumented_result, (
+            f"Result is not equal when instrumenting line {lineno}"
+        )
         reset_function(structural_test_function)
 
     @given(st.lists(st.integers()))
@@ -206,7 +217,10 @@ class TestInsturmentation(unittest.TestCase):
 
         if linenos:
             assert hasattr(structural_test_function, "__posthog_original_code")
-            assert getattr(structural_test_function, "__posthog_original_code") == original_code
+            assert (
+                getattr(structural_test_function, "__posthog_original_code")
+                == original_code
+            )
 
         reset_function(structural_test_function)
         assert structural_test_function.__code__ == original_code
@@ -256,6 +270,7 @@ class TestInsturmentation(unittest.TestCase):
         # until it is GC'd. New closures should not have the instrumentation
         # anymore
         handler_mock.assert_called_once()
+
 
 def instrumentation_present(func):
     bc = Bytecode.from_code(func.__code__)

@@ -145,7 +145,8 @@ def _instrument_code_at_line(code, bid: int, line: int):
             ):
                 new_instr.extend(_injected_code(bid))
                 injected = True
-            last_lineno = instr.lineno
+            if instr.lineno:
+                last_lineno = instr.lineno
         new_instr.append(instr)
 
     new_bc = Bytecode(new_instr)
