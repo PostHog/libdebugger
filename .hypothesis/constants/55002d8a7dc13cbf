@@ -1,0 +1,4 @@
+# file: /Users/marcecoll/posthog/libdebugger/libdebugger/instrumentation.py
+# hypothesis_version: 6.140.3
+
+['$breakpoint_id', '$data_breakpoint_hit', '$file_path', '$line_number', '$locals_variables', '$stack_trace', '$thread_id', '$thread_name', '$timestamp', 'CALL', 'CALL_FUNCTION', 'JUMP_BACKWARD', 'LOAD_CONST', 'LOAD_GLOBAL', 'POP_TOP', 'PRECALL', 'RETURN_VALUE', '_', 'lineno', 'name']

@@ -1,0 +1,4 @@
+# file: /Users/marcecoll/posthog/libdebugger/.tox/3.12/bin/pytest
+# hypothesis_version: 6.140.3
+
+['-script.pyw', '.exe', '__main__']

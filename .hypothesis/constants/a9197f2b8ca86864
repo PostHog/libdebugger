@@ -1,0 +1,4 @@
+# file: /Applications/PyCharm.app/Contents/plugins/python-ce/helpers/pycharm/teamcity/unittestpy.py
+# hypothesis_version: 6.140.3
+
+['%s (%s)', ', ', '.', ': ', 'Error', 'Expected failure: ', 'Failure', 'Skip', 'Skipped', 'SubTest error: %s\n', 'SubTest failure: %s\n', 'SubTest skipped', 'Success', '\\2.\\1', '^(.*) \\((.*)\\)$', '_', '__main__', '_subtest', '_testMethodName', 'addExpectedFailure', 'addSubTest', 'addUnexpectedSuccess', 'args', 'buffer', 'case.py', 'diff_tools', 'doctest.DocTestCase', 'failfast', 'message', 'true']

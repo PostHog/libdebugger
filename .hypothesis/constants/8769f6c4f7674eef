@@ -1,0 +1,4 @@
+# file: /Applications/PyCharm.app/Contents/plugins/python-ce/helpers/pycharm/_jb_unittest_runner.py
+# hypothesis_version: 6.140.3
+
+['-p', '-s', '-t', '__main__', 'discover', 'python -m unittest', 'unittests']

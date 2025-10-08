@@ -3,7 +3,7 @@ from unittest.mock import patch
 from bytecode import Bytecode
 from hypothesis import given, strategies as st, settings
 
-from libdebugger.instrumentation import instrument_function_at_line, reset_function
+from libdebugger.instrumentation import instrument_function_at_line, reset_function, _injected_code
 
 
 def structural_test_function(x, y=5, *args, **kwargs):
@@ -56,11 +56,11 @@ def structural_test_function(x, y=5, *args, **kwargs):
         try:
             value = 10
             result += value
-        except:
+        except ValueError:
             result += 777
         finally:
             result += 2
-    except:
+    except ValueError:
         result += 666
 
     add_lambda = lambda a, b: a + b
@@ -192,19 +192,53 @@ class TestInsturmentation(unittest.TestCase):
     )
     @settings(deadline=None)
     def test_instrumenting(self, linenos, arg_x, arg_y, arg_args, arg_flag):
+        print(f"HOLA {linenos}", arg_x, arg_y, arg_args, arg_flag)
+        expected_result = structural_test_function(
+            arg_x, arg_y, *arg_args, flag=arg_flag
+        )
+
+        print("HOLA1")
+
+        for lineno in linenos:
+            instrument_function_at_line(structural_test_function, 0, lineno)
+        print("HOLA2")
+        assert instrumentation_present(structural_test_function)
+        print("HOLA1?")
+        instrumented_result = structural_test_function(
+            arg_x, arg_y, *arg_args, **{"flag": arg_flag}
+        )
+        print(f"HOLA3 {instrumented_result}")
+        assert expected_result == instrumented_result, (
+            f"Result is not equal when instrumenting line {lineno}"
+        )
+        print("HOLA4")
+        reset_function(structural_test_function)
+        print("HOLA5")
+
+    def test_instrumenting_regression_1(self):
+        linenos = [41]
+        arg_x = 0
+        arg_y = 0
+        arg_args = (0,)
+        arg_flag = False
+
         expected_result = structural_test_function(
             arg_x, arg_y, *arg_args, flag=arg_flag
         )
 
         for lineno in linenos:
             instrument_function_at_line(structural_test_function, 0, lineno)
+
         assert instrumentation_present(structural_test_function)
+
         instrumented_result = structural_test_function(
             arg_x, arg_y, *arg_args, **{"flag": arg_flag}
         )
+
         assert expected_result == instrumented_result, (
             f"Result is not equal when instrumenting line {lineno}"
         )
+
         reset_function(structural_test_function)
 
     @given(st.lists(st.integers()))
@@ -230,7 +264,8 @@ class TestInsturmentation(unittest.TestCase):
     def test_exhaustive_instrumentation(self, handler_mock, *, a, b):
         res = simple_function(a, b)
         expected_calls = []
-        for i in range(162, 166):
+        func_first_lineno = get_lineno_of_function(simple_function)
+        for i in range(func_first_lineno + 1, func_first_lineno + 4):
             expected_calls.append(unittest.mock.call(i))
             instrument_function_at_line(simple_function, i, i)
         instrumented_res = simple_function(a, b)
@@ -240,21 +275,24 @@ class TestInsturmentation(unittest.TestCase):
 
     @patch("builtins.__posthog_ykwdzsgtgp_breakpoint_handler")
     def test_early_return(self, handler_mock):
-        instrument_function_at_line(early_return, 0, 170)
+        lineno = get_lineno_of_function(early_return)
+        instrument_function_at_line(early_return, 0, lineno + 2)
         early_return(2, 8)
         handler_mock.assert_called_once()
         reset_function(early_return)
 
     @patch("builtins.__posthog_ykwdzsgtgp_breakpoint_handler")
     def test_early_return_not_taken(self, handler_mock):
-        instrument_function_at_line(early_return, 0, 170)
+        lineno = get_lineno_of_function(early_return)
+        instrument_function_at_line(early_return, 0, lineno + 2)
         early_return(4, 8)
         handler_mock.assert_not_called()
         reset_function(early_return)
 
     @patch("builtins.__posthog_ykwdzsgtgp_breakpoint_handler")
     def test_instrumentation_in_closure(self, handler_mock):
-        instrument_function_at_line(with_closure, 0, 181)
+        lineno = get_lineno_of_function(with_closure)
+        instrument_function_at_line(with_closure, 0, lineno + 5)
         cl = with_closure()
         handler_mock.assert_not_called()
         assert cl() == 13
@@ -271,7 +309,15 @@ class TestInsturmentation(unittest.TestCase):
         # anymore
         handler_mock.assert_called_once()
 
+def contains_sublist(parent, sub):
+    sub_len = len(sub)
+    return any(parent[i:i+sub_len] == sub for i in range(len(parent) - sub_len + 1))
 
 def instrumentation_present(func):
     bc = Bytecode.from_code(func.__code__)
-    return True
+    injected_code = _injected_code(0)
+    instrs = [i for i in bc]
+    return contains_sublist(instrs, injected_code)
+
+def get_lineno_of_function(f):
+    return f.__code__.co_firstlineno

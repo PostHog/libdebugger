@@ -96,7 +96,6 @@ def _enqueue_message(bp: Breakpoint, locs: Dict[str, Any], stacktrace):
         timestamp=properties["$timestamp"],
     )
     flush()
-    print("ENQUEUED")
 
 
 builtins.__posthog_ykwdzsgtgp_breakpoint_handler = _breakpoint_handler
@@ -111,11 +110,18 @@ def _injected_code(bid: int):
             Instr("CALL_FUNCTION", 1),
             Instr("POP_TOP"),
         ]
-    else:
+    elif version_info == (3, 11):
         return [
             Instr("LOAD_GLOBAL", (True, "__posthog_ykwdzsgtgp_breakpoint_handler")),
             Instr("LOAD_CONST", bid),
             Instr("PRECALL", 1),
+            Instr("CALL", 1),
+            Instr("POP_TOP"),
+        ]
+    else:
+        return [
+            Instr("LOAD_GLOBAL", (True, "__posthog_ykwdzsgtgp_breakpoint_handler")),
+            Instr("LOAD_CONST", bid),
             Instr("CALL", 1),
             Instr("POP_TOP"),
         ]
@@ -141,12 +147,16 @@ def _instrument_code_at_line(code, bid: int, line: int):
         if hasattr(instr, "lineno"):
             if not injected and (
                 (last_lineno != instr.lineno and last_lineno >= line)
-                or (instr.lineno == line and instr.name == "RETURN_VALUE")
+                or (
+                    instr.lineno == line
+                    and (instr.name in ("RETURN_VALUE", "JUMP_BACKWARD"))
+                )
             ):
                 new_instr.extend(_injected_code(bid))
                 injected = True
-            if instr.lineno:
+            if instr.lineno is not None:
                 last_lineno = instr.lineno
+
         new_instr.append(instr)
 
     new_bc = Bytecode(new_instr)
