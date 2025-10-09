@@ -1,7 +1,11 @@
 # libdebugger
 
-A Python library that enables live debugging in production through runtime bytecode instrumentation. Set breakpoints remotely 
-via PostHog and capture local variables, stack traces, and execution context without stopping your application.
+> [!WARNING]
+> This is an **EXPERIMENTAL** library not ready for production use. For internal use only (for now).
+
+A Python library that enables live debugging in production through runtime bytecode instrumentation. 
+Set breakpoints remotely via PostHog and capture local variables, stack traces, and execution context 
+without stopping your application.
 
 ## Test
 
