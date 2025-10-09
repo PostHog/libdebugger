@@ -7,7 +7,7 @@ requires-python = ">=3.9"
 dependencies = [
     "bytecode>=0.17.0",
     "jsonpickle>=4.1.1",
-    "posthog>=6.7.6",
+    "posthoganalytics>=6.7.4",
 ]
 
 [dependency-groups]

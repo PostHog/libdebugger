@@ -1,8 +1,8 @@
 import logging
 from typing import List, Optional, Tuple
-from posthog.poller import Poller
+from posthoganalytics.poller import Poller
 from datetime import timedelta
-from posthog.request import get, APIError
+from posthoganalytics.request import get, APIError
 from collections import defaultdict
 
 from libdebugger import Breakpoint

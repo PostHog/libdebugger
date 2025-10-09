@@ -77,7 +77,7 @@ def _breakpoint_handler(bid: int):
 
 
 def _enqueue_message(bp: Breakpoint, locs: Dict[str, Any], stacktrace):
-    from posthog import capture, flush
+    from posthoganalytics import capture, flush
 
     properties = {
         "$breakpoint_id": bp.uuid,
