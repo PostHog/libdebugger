@@ -55,7 +55,7 @@ class LiveDebuggerManager:
         try:
             response = get(
                 self.client.personal_api_key,
-                f"/api/environments/@current/live_debugger_breakpoints/?token={self.client.api_key}",
+                f"/api/projects/@current/live_debugger_breakpoints/active/",
                 self.client.host,
                 timeout=10,
             )
