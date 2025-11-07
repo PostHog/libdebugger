@@ -3,6 +3,7 @@ Bytecode manipulation utilities
 """
 
 import sys
+import inspect
 from types import CodeType
 from typing import Any, Callable, List, Optional, Tuple, Union
 from bytecode import Bytecode, CompilerFlags
@@ -137,11 +138,14 @@ def redirector_code(who_to_call: Callable[..., Any]) -> Bytecode:
 
 class Injector:
     code_generator: CodeGenerator
+    original_code: Optional[CodeType]
 
     def __init__(self, *, code_generator: CodeGenerator):
         self.code_generator = code_generator
+        self.original_code = None
 
     def inject(self, code: CodeType) -> Bytecode:
+        self.original_code = code
         bc = Bytecode.from_code(code)
         new_instrs: List[BytecodeType] = []
 
@@ -161,6 +165,12 @@ class Injector:
         self, _prev_instr: Optional[BytecodeType], _instr: BytecodeType
     ) -> bool:
         return False
+
+    def is_generator(self) -> bool:
+        if self.original_code:
+            return bool(self.original_code.co_flags & inspect.CO_GENERATOR)
+        else:
+            return False
 
     def _copy_metadata(self, *, old: Bytecode, new: Bytecode):
         for attr in self._get_metadata_attributes_to_copy():
@@ -195,14 +205,22 @@ class EntrypointInjector(Injector):
     ) -> bool:
         if self.injected:
             return False
-        elif (is_py39() or is_py310()) and prev_instr is None:
+        elif is_py310():
+            if self.is_generator():
+                if isinstance(prev_instr, Instr) and prev_instr.name == "GEN_START":
+                    self.injected = True
+                    return True
+            elif prev_instr is None:
+                self.injected = True
+                return True
+            return False
+        elif is_py39() and prev_instr is None:
             self.injected = True
             return True
         elif is_py311() or is_py312() or is_py313():
             if isinstance(prev_instr, Instr) and prev_instr.name == "RESUME":
                 self.injected = True
                 return True
+            return False
         else:
             raise RuntimeError("We don't support this version of python")
-
-        return False

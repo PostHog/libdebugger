@@ -1,6 +1,7 @@
 import datetime
 import threading
 import sys
+import inspect
 from typing import Callable, Final, Optional, Dict, List, Any, Set, Tuple
 from types import CodeType, FrameType, FunctionType
 
@@ -90,6 +91,16 @@ class InstrumentationDecorator:
         # instrumentation decorator.
         self.entry_probes = entry_probes
         self.exit_probes = exit_probes
+
+        # Handle bound methods by unwrapping to the underlying function
+        self._is_bound_method = False
+        self._method_self = None
+        if inspect.ismethod(fn):
+            # This is a bound method (instance method or classmethod)
+            self._is_bound_method = True
+            self._method_self = fn.__self__  # type: ignore
+            fn = fn.__func__  # type: ignore
+
         self.original_code = fn.__code__
         self.wrapped_fn = fn
         instrumented_code = self._instrument_frame_capture_and_entry_probes()
@@ -100,6 +111,11 @@ class InstrumentationDecorator:
             fn.__defaults__,
             fn.__closure__,
         )
+
+        # Preserve keyword-only defaults
+        if hasattr(fn, "__kwdefaults__"):
+            self.instrumented_fn.__kwdefaults__ = fn.__kwdefaults__
+
         self.redirector_code = self._generate_redirector_code()
         self.wrapped_fn.__code__ = self.redirector_code
         self.frames = []
