@@ -1,3 +1,8 @@
 {
-    "git.enabled": false
+    "git.enabled": false,
+    "python.testing.pytestArgs": [
+        "test"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
 }
