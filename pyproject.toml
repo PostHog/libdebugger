@@ -23,3 +23,15 @@ dev = [
 
 [tool.uv.sources]
 hogtrace = { git = "https://github.com/PostHog/hogtrace" }
+
+[project.entry-points.pytest11]
+libdebugger_stress = "libdebugger.pytest_stress"
+
+[tool.pytest.ini_options]
+# Pytest-libdebugger-stress configuration
+# Enable with: pytest --libdebugger-stress
+# Or uncomment the line below to enable by default:
+# libdebugger_stress_enabled = true
+libdebugger_stress_num_functions = 30
+libdebugger_stress_rotation_interval = 5
+libdebugger_stress_max_reruns = 2
