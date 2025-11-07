@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "bytecode>=0.17.0",
+    "hogtrace",
     "jsonpickle>=4.1.1",
     "posthoganalytics>=6.7.4",
 ]
@@ -13,7 +14,12 @@ dependencies = [
 [dependency-groups]
 dev = [
     "hypothesis>=6.140.3",
+    "ipython>=8.18.1",
+    "pre-commit>=4.3.0",
     "pytest>=8.4.2",
     "ruff>=0.13.3",
     "tox>=4.30.3",
 ]
+
+[tool.uv.sources]
+hogtrace = { git = "https://github.com/PostHog/hogtrace" }

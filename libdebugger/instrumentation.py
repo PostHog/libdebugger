@@ -1,218 +1,293 @@
-import types
 import datetime
 import threading
 import sys
-import builtins
-import inspect
-from typing import Callable, Optional, Dict, List, Any
+from typing import Callable, Final, Optional, Dict, List, Any, Set, Tuple
+from types import CodeType, FrameType, FunctionType
 
-import jsonpickle
-from bytecode import Bytecode, Instr
-from libdebugger import Breakpoint, file_utils
+from hogtrace import Probe, Program, execute_probe, get_store, get_scope, ProbeSpec
 
-
-def _serialize(v):
-    return jsonpickle.dumps(v, unpicklable=True)
-
-
-_BREAKPOINTS: Dict[int, List[Breakpoint]] = {}
+from libdebugger.bytecode import (
+    EntrypointInjector,
+    generate_code_call_self_method,
+    redirector_code,
+)
 
 
-def register_breakpoints(bid: int, bps: List[Breakpoint]):
-    _BREAKPOINTS[bid] = bps
+class InstrumentationDecorator:
+    """
+    InstrumentationDecorator enables dynamic entry/exit probes on functions.
+
+    Unlike standard decorators, this works on ALL references to a function, even those
+    created before instrumentation, by replacing the original function's bytecode with
+    a redirect to the decorator.
+
+    Architecture:
+
+        func = InstrumentationDecorator(func, entry_probes, exit_probes)
+
+        Before:                         After:
+        ┌─────────────┐                ┌─────────────┐
+        │   func()    │                │   func()    │ (original reference)
+        │             │                │             │
+        │  original   │                │  redirect   │───┐
+        │  bytecode   │                │  bytecode   │   │
+        └─────────────┘                └─────────────┘   │
+                                                         │
+       old_ref = func                  old_ref = func    │ ALL references
+                                                         │ redirect through
+                                                         │ decorator
+                                                         │
+                                                         ▼
+                                             ┌────────────────────┐
+                                             │    Decorator       │
+                                             │   __call__()       │
+                                             └────────────────────┘
+                                                         │
+                                                         │ calls
+                                                         ▼
+                                             ┌────────────────────┐
+                                             │  instrumented_fn   │
+                                             │                    │
+                                             │ original bytecode  │
+                                             │ + entry probes     │
+                                             └────────────────────┘
+
+    Flow:
+      1. Entry: Bytecode injection captures frame and runs entry probes
+      2. Execution: Original function body executes
+      3. Exit: Decorator's try/finally runs exit probes with captured frame
+
+    This ensures exit probes execute on both normal returns and exceptions,
+    without complex bytecode manipulation of exception handling.
+    """
+
+    # The wrapped function, after __init__ this function will contain the
+    # redirector_code.
+    wrapped_fn: Final[Callable[..., Any]]
+
+    # Original code of the function, so we can replace it before being deleted
+    original_code: Final[CodeType]
+    # Code for the redirector function, the original function code gets change to
+    # redirect to the decorator, this makes sure that all instances go through here,
+    # even if they were created before the decorator was created.
+    redirector_code: Final[CodeType]
+    # The original code instrumented with entry and line probes.
+    instrumented_fn: FunctionType
+
+    entry_probes: Set[Tuple[Program, Probe]]
+    exit_probes: Set[Tuple[Program, Probe]]
+
+    # Stack of frames, so we can properly evaluate the exit probes in the context of the function even after exit.
+    frames: List[FrameType]
+
+    def __init__(
+        self,
+        fn: Callable[..., Any],
+        entry_probes: Set[Tuple[Program, Probe]],
+        exit_probes: Set[Tuple[Program, Probe]],
+    ) -> None:
+        # TODO(Marce): Refuse to add decorator to a function that has already been decorated with the
+        # instrumentation decorator.
+        self.entry_probes = entry_probes
+        self.exit_probes = exit_probes
+        self.original_code = fn.__code__
+        self.wrapped_fn = fn
+        instrumented_code = self._instrument_frame_capture_and_entry_probes()
+        self.instrumented_fn = FunctionType(
+            instrumented_code,
+            fn.__globals__,
+            fn.__name__,
+            fn.__defaults__,
+            fn.__closure__,
+        )
+        self.redirector_code = self._generate_redirector_code()
+        self.wrapped_fn.__code__ = self.redirector_code
+        self.frames = []
+
+    def __getattr__(self, name: str) -> Any:
+        """
+        Fallback to the real function methods by default
+        """
+        return getattr(self.wrapped_fn, name)
+
+    def __del__(self):
+        """
+        If we are going to die, we need to restore the
+        """
+        self.cleanup()
+
+    def cleanup(self):
+        """
+        Return the wrapped function to the original state
+        """
+        self.wrapped_fn.__code__ = self.original_code
+
+    def add_probe(self, probe: Probe):
+        """
+        Adds an entry probe to the
+        """
+        # if it's an entry probe, just add to entry probes
+        # else if it's a line probe, we need to instrument the bytecode directly
+        pass
+
+    def remove_probe(self, probe: Probe):
+        pass
+
+    def _push_frame(self, frame: FrameType) -> None:
+        """
+        This method will be called from inside the function at the start of the function
+        to internally store the frame, this way we will have it available on return/exception
+        to execute the probe inside the wrapped_fn frame.
+        """
+        self.frames.append(frame)
+
+    def _generate_redirector_code(self) -> CodeType:
+        """Generate redirector bytecode that loads decorator from constants"""
+        # Create a new redirector code to self
+        new_bc = redirector_code(self)
+        new_bc.name = self.original_code.co_name
+        new_bc.filename = self.original_code.co_filename
+        new_bc.first_lineno = self.original_code.co_firstlineno
+
+        # Preserve freevars and cellvars from original function so code assignment works
+        # (even though redirector doesn't actually use them)
+        new_bc.freevars = list(self.original_code.co_freevars)
+        new_bc.cellvars = list(self.original_code.co_cellvars)
+
+        return new_bc.to_code()
+
+    def _instrument_frame_capture_and_entry_probes(self) -> CodeType:
+        """
+        This function does runtime bytecode manipulation on the wrapped function
+        to call `_capture_caller_frame_and_run_entry_probes` on this same instance as soon
+        as the function starts.
+        """
+        code = self.wrapped_fn.__code__
+        injector = EntrypointInjector(
+            code_generator=generate_code_call_self_method(
+                self, "_capture_caller_frame_and_run_entry_probes"
+            ),
+        )
+
+        return injector.inject(code).to_code()
+
+    def _capture_caller_frame_and_run_entry_probes(self) -> None:
+        # We run the entry probes inside another nested try..except since any
+        # error in our side should NEVER disrupt the user code.
+        try:
+            caller_frame = sys._getframe(1)  # type: ignore
+            self._push_frame(caller_frame)
+
+            if self.entry_probes:
+                for program, probe in self.entry_probes:
+                    req_store = get_store()
+                    assert req_store  # This is very awkward to use...
+                    store = req_store.for_program(program_id=program.id)
+
+                    captures = execute_probe(
+                        program.program_bytecode, probe, caller_frame, store
+                    )
+
+                    if captures:
+                        _enqueue_message(program, probe, captures)
+        except Exception as e:
+            print(f"EXC {e}")
+            # TODO(Marce): Do something here to notify us?
+            pass
+
+    def _pop_frame(self) -> Optional[FrameType]:
+        try:
+            return self.frames.pop()
+        except IndexError:
+            return None
+
+    def _peek_frame(self) -> Optional[FrameType]:
+        try:
+            return self.frames[-1]
+        except IndexError:
+            return None
+
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        # We want to make sure we are not getting the same frame we already have
+        #  when we do `_pop_frame()` down below. If for any reason the function
+        # crashed before we capture the frame (or while capturing the frame) then
+        # we would pop a frame that is not ours. This would case wrong evaluations
+        # in cases of recursive functions. To be fair, if the function crashes before
+        # we are already quite doomed, but you still use toilet paper when you are sick.
+        function_frame: Optional[FrameType] = None
+        previous_frame = self._peek_frame()
+        exception: Optional[Exception] = None
+        retval: Any = None
+
+        try:
+            retval = self.instrumented_fn(*args, **kwds)
+            return retval
+        except Exception as e:
+            exception = e
+            raise
+        finally:
+            function_frame = self._pop_frame()
+
+            if function_frame == previous_frame and function_frame is not None:
+                # We didn't create a new frame for whatever reason! Return this one to
+                # the stack and reset function_frame
+                # TODO(Marce): Do something here to notify us?
+                self._push_frame(function_frame)
+            elif function_frame:
+                try:
+                    if self.exit_probes:
+                        for program, probe in self.exit_probes:
+                            req_store = get_store()
+                            assert req_store  # This is very awkward to use...
+                            store = req_store.for_program(program_id=program.id)
+
+                            captures = execute_probe(
+                                program.program_bytecode,
+                                probe,
+                                function_frame,
+                                store,
+                                retval=retval,
+                                exception=exception,
+                            )
+
+                            if captures:
+                                _enqueue_message(program, probe, captures)
+
+                except Exception:
+                    # TODO(Marce): Do something here to notify us?
+                    pass
+            else:
+                # TODO(Marce): Do something here to notify us?
+                pass
 
 
-def reset_breakpoint_registry():
-    _BREAKPOINTS = {}
+def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]):
+    from posthoganalytics import capture
 
+    scope = get_scope()
+    assert scope is not None
 
-def get_breakpoint_definition_by_bid(bid: int) -> Optional[Breakpoint]:
-    return _BREAKPOINTS.get(bid)
-
-
-def _breakpoint_handler(bid: int):
-    try:
-        breakpoint_definitions = get_breakpoint_definition_by_bid(bid)
-
-        if not breakpoint_definitions:
-            # TODO(Marce): We should remove the instrumentation, that
-            # breakpoint doesnt exist anymore
-            return
-
-        # start from the frame above to not show the _breakpoint_handler
-        cframe = sys._getframe().f_back
-        loc = cframe.f_locals
-
-        # If no condition matches for any breakpoint, we don't have
-        # anything to do
-        breakpoints_that_match = [
-            bd for bd in breakpoint_definitions if bd.condition_matches(loc)
-        ]
-        if not breakpoints_that_match:
-            return
-
-        framestack = []
-        while cframe is not None:
-            framestack.append(
-                (cframe.f_code.co_filename, cframe.f_code.co_name, cframe.f_lineno)
-            )
-            cframe = cframe.f_back
-
-        locals_locals = {
-            k: _serialize(v)
-            for k, v in loc.items()
-            if not (
-                callable(v)  # Exclude functions
-                or isinstance(v, type)  # Exclude classes
-                or isinstance(v, types.ModuleType)  # Exclude modules
-                or k.startswith("_")  # Exclude private/dunder
-            )
-        }
-
-        for bp in breakpoints_that_match:
-            _enqueue_message(bp, locals_locals, framestack)
-
-    except Exception as e:
-        print(f"Error in _breakpoint_handler: {e}")
-
-
-def _enqueue_message(bp: Breakpoint, locs: Dict[str, Any], stacktrace):
-    from posthoganalytics import capture, flush
-
-    properties = {
-        "$breakpoint_id": bp.uuid,
-        "$file_path": bp.filename,
-        "$line_number": bp.lineno,
-        "$locals_variables": locs,
-        "$stack_trace": stacktrace,
-        "$timestamp": datetime.datetime.now(),
-        "$thread_id": threading.current_thread().ident,
-        "$thread_name": threading.current_thread().name,
+    properties: Dict[str, Any] = {
+        "program_id": program.id,
+        "probe_id": probe.id,
+        "context_id": scope.context_id,
+        "probe_spec": serialize_probe_spec(probe.spec),
+        "captures": captures,
+        # "$stack_trace": stacktrace,
+        "timestamp": datetime.datetime.now(),
+        "thread_id": threading.current_thread().ident,
+        "thread_name": threading.current_thread().name,
     }
 
     capture(
-        "$data_breakpoint_hit",
+        "$hogtrace_capture",
         properties=properties,
-        timestamp=properties["$timestamp"],
-    )
-    flush()
-
-
-builtins.__posthog_ykwdzsgtgp_breakpoint_handler = _breakpoint_handler
-
-
-def _injected_code(bid: int):
-    version_info = sys.version_info
-    if version_info < (3, 11):
-        return [
-            Instr("LOAD_GLOBAL", "__posthog_ykwdzsgtgp_breakpoint_handler"),
-            Instr("LOAD_CONST", bid),
-            Instr("CALL_FUNCTION", 1),
-            Instr("POP_TOP"),
-        ]
-    elif version_info == (3, 11):
-        return [
-            Instr("LOAD_GLOBAL", (True, "__posthog_ykwdzsgtgp_breakpoint_handler")),
-            Instr("LOAD_CONST", bid),
-            Instr("PRECALL", 1),
-            Instr("CALL", 1),
-            Instr("POP_TOP"),
-        ]
-    else:
-        return [
-            Instr("LOAD_GLOBAL", (True, "__posthog_ykwdzsgtgp_breakpoint_handler")),
-            Instr("LOAD_CONST", bid),
-            Instr("CALL", 1),
-            Instr("POP_TOP"),
-        ]
-
-
-def _instrument_code_at_line(code, bid: int, line: int):
-    last_lineno = 0
-    new_instr = []
-    bc = Bytecode.from_code(code)
-    injected = False
-
-    for instr in bc:
-        # NOTE(Marce): This may not be enough for all cases
-        if (
-            hasattr(instr, "name")
-            and instr.name == "LOAD_CONST"
-            and inspect.iscode(instr.arg)
-        ):
-            # NOTE(Marce): Closures will still have the instrumentation even if we reset
-            # the function.
-            instr.arg = _instrument_code_at_line(instr.arg, bid, line)
-
-        if hasattr(instr, "lineno"):
-            if not injected and (
-                (last_lineno != instr.lineno and last_lineno >= line)
-                or (
-                    instr.lineno == line
-                    and (instr.name in ("RETURN_VALUE", "JUMP_BACKWARD"))
-                )
-            ):
-                new_instr.extend(_injected_code(bid))
-                injected = True
-            if instr.lineno is not None:
-                last_lineno = instr.lineno
-
-        new_instr.append(instr)
-
-    new_bc = Bytecode(new_instr)
-    # We should copy more things, name, etc
-    new_bc.argnames = bc.argnames
-    new_bc.cellvars = bc.cellvars
-    new_bc.freevars = bc.freevars
-    new_bc.argcount = bc.argcount
-    new_bc.filename = bc.filename
-    new_bc.docstring = bc.docstring
-    new_bc.posonlyargcount = bc.posonlyargcount
-    new_bc.kwonlyargcount = bc.kwonlyargcount
-    new_bc.flags = bc.flags
-    new_bc.filename = bc.filename
-    new_bc.first_lineno = bc.first_lineno
-    new_bc.name = bc.name
-
-    return new_bc.to_code()
-
-
-def instrument_function_at_line(func: Callable, bid: int, lineno: int) -> bool:
-    original_code = func.__code__
-
-    if not hasattr(func, "__posthog_original_code"):
-        setattr(func, "__posthog_original_code", original_code)
-
-    func.__code__ = _instrument_code_at_line(original_code, bid, lineno)
-    return True
-
-
-def reset_function(func):
-    if hasattr(func, "__posthog_original_code"):
-        func.__code__ = getattr(func, "__posthog_original_code")
-
-
-def instrument_function_at_filename_and_line(
-    filename: str, lineno: int, bid: int
-) -> bool:
-    """
-    Main entrypoint of the library, given a filename and a line number
-    add a data breakpoint at that position.
-    """
-    target_function_obj = file_utils.find_function_at(filename, lineno)
-
-    print(
-        f"[LIVE DEBUGGER] Insturment function at {filename} {lineno}: {target_function_obj}"
+        timestamp=properties["timestamp"],
     )
 
-    if target_function_obj:
-        instrument_function_at_line(target_function_obj, bid, lineno)
-    else:
-        return False
 
-
-def reset_function_at_filename_and_line(filename: str, lineno: int) -> bool:
-    target_function_obj = file_utils.find_function_at(filename, lineno)
-
-    if target_function_obj:
-        reset_function(target_function_obj)
+def serialize_probe_spec(spec: ProbeSpec) -> Dict[str, str]:
+    return {
+        "specifier": spec.specifier,
+        "target": spec.target,
+    }
