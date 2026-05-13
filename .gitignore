@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Hypothesis example database
+.hypothesis/
+
+# Tooling caches
+.tox/
+.pytest_cache/
+.ruff_cache/
+
+# Editor / OS
+.DS_Store

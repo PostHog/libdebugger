@@ -8,9 +8,76 @@ Python function signatures without errors.
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from libdebugger.instrumentation import InstrumentationDecorator
 from hogtrace.vm import compile, package
 from hogtrace.context import new_context
+
+# Phase 1 of the hogtrace-manager rewrite (see docs/superpowers/specs/
+# 2026-05-13-hogtrace-manager-design.md) removed the
+# ``entry_probes``/``exit_probes`` constructor parameters from
+# ``InstrumentationDecorator``. Probes now live in a module-level registry.
+#
+# These tests exercise the deleted API. Skip at module scope; Phase 2's
+# property tests replace them.
+#
+# CHECKLIST — what these skipped tests covered, for the Phase 2+ port:
+#
+#   * Simple positional args (test_simple_function): two-positional-arg
+#     function with no defaults; basic sanity that capture fires once.
+#   * Default arguments (test_function_with_defaults): mix of required
+#     and defaulted positional args; instrument and call with 1/2/3 args.
+#   * *args (test_function_with_args): variadic positional handling.
+#   * **kwargs (test_function_with_kwargs): variadic keyword handling.
+#   * *args + **kwargs combined (test_function_with_args_and_kwargs).
+#   * Keyword-only arguments (test_function_keyword_only): args after
+#     bare ``*`` separator with and without defaults — requires
+#     __kwdefaults__ to be preserved on instrumented_fn.
+#   * Positional-only arguments (test_function_positional_only): args
+#     before ``/`` separator (PEP 570, Python 3.8+).
+#   * Mixed full-signature (test_function_mixed_signature): every kind
+#     in one function — positional-only, regular, default, *args,
+#     kw-only, kw-only-with-default, **kwargs — single round-trip.
+#   * Lambdas (test_lambda_function, test_lambda_with_defaults): the
+#     decorator must handle code objects whose source is a lambda.
+#   * Simple closure (test_closure): inner function capturing one
+#     free var from outer.
+#   * Nested closure (test_nested_closure): three-deep nesting with
+#     multiple free vars resolved across levels.
+#   * Nonlocal mutation (test_closure_with_nonlocal): closure that
+#     mutates an enclosing-scope binding via ``nonlocal`` — verifies
+#     cellvar/freevar preservation through instrumentation.
+#   * Generator function (test_generator_function): instrumenting a
+#     function whose ``__code__`` has CO_GENERATOR set — entry probe
+#     should fire on initial call, not on each ``next()``.
+#   * Instance method (test_method): instrumenting a bound method;
+#     the wrapper must unwrap to ``__func__`` so the class-level
+#     descriptor sees the redirect.
+#   * Classmethod (test_class_method): instrumenting through the
+#     classmethod descriptor.
+#   * Staticmethod (test_static_method): instrumenting through the
+#     staticmethod descriptor.
+#   * Zero-arg function (test_no_args_function): edge case for the
+#     bytecode injector — no argument-shuffling preamble.
+#   * Type annotations (test_function_with_annotations): instrumented_fn
+#     must preserve ``__annotations__`` so introspection still works.
+#   * Recursion (test_recursive_function): self-recursive function;
+#     entry probe should fire once per call frame.
+#   * Function returning a closure (test_function_returning_lambda):
+#     only the outer fn is instrumented — inner lambda must NOT inherit
+#     the redirect.
+#   * Exception path (test_function_with_exception): function that
+#     raises on some inputs; entry probe fires on both success and
+#     failure paths, exit probe (when present) sees the exception.
+#   * Async function (test_async_function): ``async def`` — decorator
+#     must accept the coroutine function without choking (full async
+#     probe semantics are out of scope; this is a "doesn't crash" test).
+pytestmark = pytest.mark.skip(
+    reason="Phase 2+: probes via _PROBE_INDEX registry, not wrapper state. "
+    "Replaced by test_manager_property.py from Phase 1 onward. "
+    "See module-level checklist above for the categories to re-cover."
+)
 
 
 class TestInstrumentationDecoratorSignatures(unittest.TestCase):

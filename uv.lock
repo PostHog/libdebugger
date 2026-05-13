@@ -226,7 +226,7 @@ wheels = [
 [[package]]
 name = "hogtrace"
 version = "0.2.0"
-source = { git = "https://github.com/PostHog/hogtrace#35cb0db828e2305d1fd40c5d73c10db19aef30a7" }
+source = { git = "https://github.com/PostHog/hogtrace#1bb930b5ae095a8cf03e9b6e43fa8073ca0bbbcd" }
 
 [[package]]
 name = "hypothesis"
