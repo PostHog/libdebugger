@@ -210,22 +210,34 @@ def install_program(program: Program) -> None:
 
 
 def uninstall_program(program_id: str) -> None:
-    """Stub: raises NotImplementedError until Phase 3 lands.
+    """Remove ``program_id`` from the registry and rebuild ``_PROBE_INDEX``.
 
-    Phase 3 will implement: remove ``program_id`` from ``_INSTALLED_PROGRAMS``,
-    rebuild ``_PROBE_INDEX``, and let wrappers self-clean on next call.
+    Side effects under ``_LOCK``:
+      1. ``_instr_module._INSTALLED_PROGRAMS.pop(program_id, None)`` —
+         silently no-op when the id was never installed.
+      2. ``_rebuild_probe_index()`` — atomic-rebinds ``_PROBE_INDEX`` so
+         the wrapper's hot path no longer sees this program's probes.
+
+    Wrappers don't get torn down here. Each wrapper detects its empty
+    registry slot on its next call and self-cleans then (Phase 4
+    convergence). This keeps ``uninstall_program`` cheap and lock-light
+    while still guaranteeing eventual cleanup of bytecode mutations.
     """
-    raise NotImplementedError("uninstall_program lands in Phase 3")
+    with _LOCK:
+        _instr_module._INSTALLED_PROGRAMS.pop(program_id, None)
+        _rebuild_probe_index()
 
 
 def update_program(program: Program) -> None:
-    """Stub: raises NotImplementedError until Phase 3 lands.
+    """Replace any existing install of ``program.id`` with ``program``.
 
-    Phase 3 will implement the spec definition
-    ``uninstall_program(program.id); install_program(program)`` once
-    ``uninstall_program`` is real.
+    Defined as ``uninstall_program(program.id); install_program(program)``.
+    Each call grabs ``_LOCK`` separately — we MUST NOT hold the lock
+    across both because ``_LOCK`` is a ``threading.Lock`` (non-reentrant)
+    and ``install_program`` re-acquires it.
     """
-    raise NotImplementedError("update_program lands in Phase 3")
+    uninstall_program(program.id)
+    install_program(program)
 
 
 # ---------------------------------------------------------------------------

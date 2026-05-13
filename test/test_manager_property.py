@@ -523,6 +523,224 @@ def test_resolve_target_returns_none_for_module():
     assert resolve_target("test.target") is None
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Registry & index consistency (P2, P3)
+# ---------------------------------------------------------------------------
+#
+# Hand-written tests for uninstall_program / update_program cover the common
+# cases for clarity; the RuleBasedStateMachine below explores arbitrary
+# install/uninstall/update sequences and asserts P2 + P3 invariants after
+# every step.
+
+
+def test_uninstall_program_removes_from_registry(hogtrace_scope):
+    """After install + uninstall, both registries are empty."""
+    from libdebugger.manager import install_program, uninstall_program
+
+    program = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="prog-u1",
+    )
+    install_program(program)
+    assert "prog-u1" in instr._INSTALLED_PROGRAMS
+    assert ("test.target.fn_a", "entry") in instr._PROBE_INDEX
+
+    uninstall_program("prog-u1")
+
+    assert instr._INSTALLED_PROGRAMS == {}
+    assert instr._PROBE_INDEX == {}
+
+
+def test_update_program_replaces_existing(hogtrace_scope):
+    """update_program(B) where B.id == A.id replaces A's probes with B's."""
+    from libdebugger.manager import install_program, update_program
+
+    prog_a = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="same-id",
+    )
+    prog_b = _build_program(
+        "fn:test.target.fn_b:entry { capture(x=2); }",
+        program_id="same-id",
+    )
+
+    install_program(prog_a)
+    assert instr._INSTALLED_PROGRAMS["same-id"] is prog_a
+    assert ("test.target.fn_a", "entry") in instr._PROBE_INDEX
+    assert ("test.target.fn_b", "entry") not in instr._PROBE_INDEX
+
+    update_program(prog_b)
+
+    assert instr._INSTALLED_PROGRAMS["same-id"] is prog_b
+    # B's probes replaced A's: fn_a slot is gone, fn_b slot exists.
+    assert ("test.target.fn_a", "entry") not in instr._PROBE_INDEX
+    assert ("test.target.fn_b", "entry") in instr._PROBE_INDEX
+    # And the program inside the index slot is the new B, not A.
+    pairs = instr._PROBE_INDEX[("test.target.fn_b", "entry")]
+    assert all(p is prog_b for p, _ in pairs)
+
+
+def test_uninstall_unknown_program_id_is_silent():
+    """Uninstalling a never-installed id must not raise."""
+    from libdebugger.manager import uninstall_program
+
+    # Precondition: registry is empty.
+    assert instr._INSTALLED_PROGRAMS == {}
+
+    # Must not raise.
+    uninstall_program("never-installed")
+
+    assert instr._INSTALLED_PROGRAMS == {}
+    assert instr._PROBE_INDEX == {}
+
+
+# ---------------------------------------------------------------------------
+# Stateful machine — Hypothesis explores arbitrary install/uninstall/update
+# sequences and checks the P2/P3 invariants after every step.
+# ---------------------------------------------------------------------------
+
+
+from hypothesis import settings as hyp_settings  # noqa: E402
+from hypothesis.stateful import (  # noqa: E402
+    Bundle,
+    RuleBasedStateMachine,
+    consumes,
+    invariant,
+    rule,
+)
+
+from test.strategies import programs as programs_strategy  # noqa: E402
+
+import libdebugger.manager as manager  # noqa: E402
+
+
+def _drain_registry():
+    """Tear down everything in the registry plus any lingering wrappers.
+
+    Used as cross-round cleanup inside the stateful machine — Hypothesis
+    runs many examples within a single pytest invocation and the
+    ``reset_state`` fixture only fires between pytest test cases, not
+    between Hypothesis examples.
+    """
+    for pid in list(instr._INSTALLED_PROGRAMS):
+        try:
+            manager.uninstall_program(pid)
+        except Exception:
+            pass
+
+    # Also tear down any wrapper still attached to a target function. The
+    # production code leaves these in place until next-call self-cleanup;
+    # we need them gone between rounds so a stale wrapper from round N
+    # doesn't pollute round N+1's invariant check.
+    for _name, obj in list(vars(target_mod).items()):
+        if hasattr(obj, "__posthog_decorator"):
+            dec = getattr(obj, "__posthog_decorator")
+            try:
+                dec.cleanup()
+            except Exception:
+                pass
+            try:
+                delattr(obj, "__posthog_decorator")
+            except AttributeError:
+                pass
+        if isinstance(obj, type):
+            for _mname, mobj in list(vars(obj).items()):
+                if hasattr(mobj, "__posthog_decorator"):
+                    dec = getattr(mobj, "__posthog_decorator")
+                    try:
+                        dec.cleanup()
+                    except Exception:
+                        pass
+                    try:
+                        delattr(mobj, "__posthog_decorator")
+                    except AttributeError:
+                        pass
+
+
+class RegistryMachine(RuleBasedStateMachine):
+    """Stateful property test: install / uninstall / update + invariants.
+
+    The bundle stores ``program.id`` strings, NOT ``Program`` objects.
+    Hogtrace ``Program`` is a PyO3 wrapper that may not be deepcopy-
+    friendly and Hypothesis deepcopies bundle contents during shrinking.
+    Storing ids only sidesteps the problem entirely — we re-fetch the
+    live program from ``_INSTALLED_PROGRAMS`` inside each rule body.
+    """
+
+    program_ids = Bundle("program_ids")
+
+    def __init__(self):
+        super().__init__()
+        # Mirror of the real registry: id -> Program. Updated in lockstep
+        # with every install/uninstall/update rule so the invariant check
+        # can spot divergence.
+        self._model: dict = {}
+        # Hypothesis runs many examples per pytest case; drain anything
+        # left over from a previous round.
+        _drain_registry()
+
+    @rule(target=program_ids, program=programs_strategy())
+    def install(self, program):
+        # install_program is defined to overwrite a same-id install; the
+        # model mirrors that behavior with a plain dict assignment.
+        manager.install_program(program)
+        self._model[program.id] = program
+        return program.id
+
+    @rule(program_id=consumes(program_ids))
+    def uninstall(self, program_id):
+        manager.uninstall_program(program_id)
+        self._model.pop(program_id, None)
+
+    @rule(target=program_ids, program=programs_strategy())
+    def update(self, program):
+        # update_program == uninstall(program.id) + install(program).
+        # If the id was never installed, uninstall is a silent no-op and
+        # install adds it — net effect is identical to a fresh install.
+        manager.update_program(program)
+        self._model[program.id] = program
+        return program.id
+
+    @invariant()
+    def registry_consistent(self):
+        # P2: the set of installed program ids matches the model exactly.
+        assert set(instr._INSTALLED_PROGRAMS.keys()) == set(self._model.keys()), (
+            f"registry diverged from model: "
+            f"registry={set(instr._INSTALLED_PROGRAMS.keys())} "
+            f"model={set(self._model.keys())}"
+        )
+
+    @invariant()
+    def index_consistent(self):
+        # P3: every (program, probe) pair appearing anywhere in the
+        # index belongs to a program currently in the registry.
+        for (qualname, kind), pairs in instr._PROBE_INDEX.items():
+            for program, probe in pairs:
+                assert program.id in instr._INSTALLED_PROGRAMS, (
+                    f"_PROBE_INDEX[({qualname!r}, {kind!r})] references "
+                    f"program {program.id!r} not in _INSTALLED_PROGRAMS"
+                )
+
+    def teardown(self):
+        # Run between Hypothesis examples; the autouse ``reset_state``
+        # fixture only fires between pytest test cases. Without this,
+        # state leaks across rounds and the very first invariant check
+        # of round N+1 can fail on round N's residue.
+        _drain_registry()
+
+
+# Hypothesis defaults are usually fine; we bump max_examples a bit because
+# the stateful machine's individual examples are cheap and we want decent
+# coverage of install/uninstall/update interleavings.
+RegistryMachine.TestCase.settings = hyp_settings(
+    max_examples=50,
+    stateful_step_count=20,
+    deadline=None,
+)
+
+TestRegistry = RegistryMachine.TestCase
+
+
 def test_rebuild_probe_index_reuses_tuple_when_unchanged():
     """When _rebuild_probe_index produces the same content, it reuses the prior tuple object.
 
