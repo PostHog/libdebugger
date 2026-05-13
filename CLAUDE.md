@@ -76,7 +76,12 @@ uv run python main.py
 
 The test suite is built around Hypothesis property tests that pin the spec's invariants:
 
-- `test_manager_property.py` — Phase 1–6 properties: behavior preservation, trace fidelity, registry/index consistency, self-cleanup convergence, order-independence, recursion safety. Also hosts the `RegistryMachine` Hypothesis stateful machine.
+- `test_manager_behavior.py` — Phase 1: behavior preservation (P7). Wrapping with an empty registry is a perfect no-op.
+- `test_manager_probe_firing.py` — Phase 2: trace fidelity (P1) plus `resolve_target` and `_rebuild_probe_index` tuple-reuse coverage.
+- `test_manager_self_cleanup.py` — Phase 3 hand-written registry tests, Phase 4 self-cleanup convergence (P4), Phase 5 hand-written + Hypothesis-driven order-independence (P5).
+- `test_manager_recursion.py` — Phase 6: recursion safety (P6). Hand-written counts for fact() / recur_raise() plus a Hypothesis sweep.
+- `test_manager_registry_machine.py` — Hosts the `RegistryMachine` Hypothesis stateful machine. Asserts P2/P3/P4/P5 invariants over arbitrary install/uninstall/update sequences.
+- `_manager_helpers.py` — Shared helpers (target module, args strategies, `_build_program`, `_drain_registry`, normalization helpers). Imported by all five `test_manager_*.py` files above.
 - `test_manager_concurrency.py` — Phase 7: thread-interleaving stress, multiple worker threads calling instrumented functions while another thread reconciles.
 - `test_manager_integration.py` — Phase 8: end-to-end `HogTraceManager` wiring with mocked HTTP, deadlock-free `stop()`, and the no-API-key short-circuit.
 - `test_instrumentation*.py` — lower-level coverage of `InstrumentationDecorator` and bytecode signatures.

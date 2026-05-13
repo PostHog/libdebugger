@@ -126,7 +126,7 @@ fn.__posthog_decorator = InstrumentationDecorator(fn, qualname=probe.spec.specif
 
 Subsequent `add_probe` calls for the same function (via other probes / programs) re-use the existing wrapper; the qualname is set on first creation.
 
-For v1, `_qualname_for_specifier` is the identity function — the specifier and the qualname are the same string. The indirection exists so v2 can normalize wildcards or class-method chains without changing the registry shape.
+For v1 the specifier and the qualname are the same string — `_rebuild_probe_index` keys the registry off `probe.spec.specifier` directly. If v2 needs to normalize wildcards or class-method chains, that's the seam to add an indirection.
 
 ### `__call__` (the hot path)
 
@@ -286,7 +286,7 @@ def _rebuild_probe_index() -> None:
     new_ids: Dict[Tuple[str, str], FrozenSet[Tuple[str, str]]] = {}
     for program in _INSTALLED_PROGRAMS.values():
         for probe in program.probes:
-            key = (_qualname_for_specifier(probe.spec.specifier), probe.spec.target)
+            key = (probe.spec.specifier, probe.spec.target)
             new_raw.setdefault(key, []).append((program, probe))
             new_ids.setdefault(key, set()).add((program.id, probe.id))
     new_ids = {k: frozenset(v) for k, v in new_ids.items()}

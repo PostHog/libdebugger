@@ -10,7 +10,7 @@ from typing import Optional, List
 
 import pytest
 
-from libdebugger.instrumentation import InstrumentationDecorator
+from libdebugger import manager as _manager
 from hogtrace.vm import compile as hogtrace_compile, package
 from hogtrace.context import new_context
 
@@ -27,6 +27,8 @@ _test_context_manager = None
 _functions_pool: List = []
 _test_counter = 0
 _rerun_state: dict = {}  # test_id -> rerun_count
+_active_program_ids: List[str] = []  # synthetic Programs installed for the rotation
+_rotation_seq: int = 0  # monotonic counter so synthetic ids never collide
 
 
 def pytest_addoption(parser):
@@ -149,25 +151,51 @@ def pytest_collection_modifyitems(session, config, items):
     pass
 
 
-def _create_tracking_probes():
-    """Create probes that capture execution information."""
-    probe_source = """
-        fn:*:entry {
-            capture(executed=true, args=args, kwargs=kwargs);
-        }
-        fn:*:exit {
-            capture(returned=true, result=result);
-        }
-    """
-    program = hogtrace_compile(probe_source)
-    pkg = package("pytest-stress", program)
+def _build_synthetic_program(specifiers: List[str], program_id: str):
+    """Compile an empty-body entry+exit probe per specifier into one Program.
 
-    return pkg, program
+    The empty body keeps probe execution near-no-op — we want the
+    instrumentation path (wrapper install, redirector, entry/exit dispatch)
+    exercised, not the capture side. Each rotation gets its own unique
+    program id so install/uninstall pair cleanly.
+    """
+    if not specifiers:
+        return None
+    lines: List[str] = []
+    for spec in specifiers:
+        # Empty body: probe fires but captures nothing. The wrapper still
+        # walks the entry / exit path so the rotation stresses the registry
+        # lookup and redirector.
+        lines.append(f"fn:{spec}:entry {{ }}")
+        lines.append(f"fn:{spec}:exit {{ }}")
+    source = "\n".join(lines)
+    program = hogtrace_compile(source)
+    return package(program_id, program)
+
+
+def _specifier_for_function(func, function_info: dict) -> Optional[str]:
+    """Resolve the dotted-name specifier used to look the function up.
+
+    The manager's ``resolve_target`` walks module-attribute paths from the
+    longest module-prefix down. We construct ``<module>.<qualname>`` and
+    verify it actually resolves to the same callable before handing it to
+    the manager — otherwise install_program would silently skip the probe
+    and the plugin would falsely report zero instrumentation activity.
+    """
+    module = function_info.get("module")
+    qualname = function_info.get("qualname")
+    if not module or not qualname:
+        return None
+    specifier = f"{module}.{qualname}"
+    resolved = _manager.resolve_target(specifier)
+    if resolved is func:
+        return specifier
+    return None
 
 
 def _instrument_random_functions(terminal_reporter=None):
-    """Instrument a random selection of functions."""
-    global _tracker, _functions_pool
+    """Instrument a random selection of functions via a synthetic Program."""
+    global _tracker, _functions_pool, _active_program_ids, _rotation_seq
 
     if not _functions_pool:
         return
@@ -178,46 +206,84 @@ def _instrument_random_functions(terminal_reporter=None):
     # Randomly select functions
     selected_functions = random.sample(_functions_pool, num_to_instrument)
 
-    # Create probes
-    pkg, program = _create_tracking_probes()
-    entry_probe = (pkg, program.probes[0])
-    exit_probe = (pkg, program.probes[1])
-
-    probe_source = """
-fn:*:entry {
-    capture(executed=true, args=args, kwargs=kwargs);
-}
-fn:*:exit {
-    capture(returned=true, result=result);
-}
-"""
-
-    # Instrument each function
-    instrumented_count = 0
-    instrumented_functions = []
+    # Resolve each function to a dotted-name specifier the manager can
+    # actually find. Functions that don't resolve (closures, lambdas,
+    # things stored in containers, etc.) are skipped — install_program
+    # would skip them anyway and we want the plugin's reported count to
+    # reflect what's actually installed.
+    specifiers: List[str] = []
+    by_specifier_info: dict = {}
+    by_specifier_func: dict = {}
     for func in selected_functions:
-        try:
-            function_info = get_function_info(func)
-
-            decorator = InstrumentationDecorator(func, {entry_probe}, {exit_probe})
-
-            _tracker.add_instrumentation(
-                func, decorator, function_info, probe_source=probe_source
-            )
-            instrumented_count += 1
-            instrumented_functions.append(function_info)
-        except Exception as e:
-            # Skip functions that can't be instrumented
+        function_info = get_function_info(func)
+        specifier = _specifier_for_function(func, function_info)
+        if specifier is None:
             if terminal_reporter:
                 terminal_reporter.write_line(
-                    f"[libdebugger-stress] Warning: Failed to instrument {func.__name__}: {e}",
+                    f"[libdebugger-stress] Skipping {function_info.get('qualname', '?')}: "
+                    f"not resolvable via dotted-name walk",
                     yellow=True,
                 )
             continue
+        # Dedupe in case two pool entries resolve to the same specifier.
+        if specifier in by_specifier_info:
+            continue
+        specifiers.append(specifier)
+        by_specifier_info[specifier] = function_info
+        by_specifier_func[specifier] = func
+
+    if not specifiers:
+        return
+
+    _rotation_seq += 1
+    program_id = f"pytest-stress-rotation-{_rotation_seq}"
+    probe_source = "\n".join(
+        f"fn:{s}:entry {{ }}\nfn:{s}:exit {{ }}" for s in specifiers
+    )
+
+    synthetic_program = _build_synthetic_program(specifiers, program_id)
+    if synthetic_program is None:
+        return
+
+    try:
+        _manager.install_program(synthetic_program)
+    except Exception as e:
+        if terminal_reporter:
+            terminal_reporter.write_line(
+                f"[libdebugger-stress] install_program failed: {e}",
+                red=True,
+            )
+        return
+
+    _active_program_ids.append(program_id)
+
+    # Record what the manager actually wrapped. install_program logs and
+    # skips per-probe resolution failures; we mirror that by only
+    # recording entries whose function actually got a __posthog_decorator
+    # attribute (i.e., the wrapper landed).
+    instrumented_functions = []
+    instrumented_count = 0
+    for specifier in specifiers:
+        func = by_specifier_func[specifier]
+        if not hasattr(func, "__posthog_decorator"):
+            continue
+        function_info = by_specifier_info[specifier]
+        # The tracker's API still expects a "decorator" object; pass the
+        # one the manager just installed so cleanup_all (if it ever fires)
+        # has something callable. We don't actually need it for cleanup —
+        # uninstall_program owns the lifecycle now — but the tracker uses
+        # it for stats and reporting.
+        decorator = getattr(func, "__posthog_decorator")
+        _tracker.add_instrumentation(
+            func, decorator, function_info, probe_source=probe_source
+        )
+        instrumented_functions.append(function_info)
+        instrumented_count += 1
 
     if instrumented_count > 0 and terminal_reporter:
         terminal_reporter.write_line(
-            f"\n[libdebugger-stress] Instrumented {instrumented_count}/{len(_functions_pool)} functions:",
+            f"\n[libdebugger-stress] Instrumented {instrumented_count}/{len(_functions_pool)} functions "
+            f"(program {program_id}):",
             cyan=True,
             bold=True,
         )
@@ -233,11 +299,27 @@ fn:*:exit {
 
 
 def _cleanup_instrumentation():
-    """Clean up all current instrumentation."""
-    global _tracker
+    """Uninstall every synthetic Program this plugin installed.
+
+    Wrappers self-clean on their next call once the registry slot is empty
+    (see InstrumentationDecorator.__call__'s finally block). We don't tear
+    them down manually here — the manager's lazy-cleanup contract is what
+    the stress plugin is supposed to be stressing.
+    """
+    global _tracker, _active_program_ids
+
+    for program_id in list(_active_program_ids):
+        try:
+            _manager.uninstall_program(program_id)
+        except Exception:
+            pass
+    _active_program_ids.clear()
 
     if _tracker:
-        _tracker.cleanup_all()
+        # Drop tracker bookkeeping for the next rotation; the actual
+        # bytecode restore happens lazily inside the wrapper.
+        _tracker.active_instrumentations.clear()
+        _tracker.records.clear()
 
 
 def _rotate_instrumentation(terminal_reporter=None):
@@ -303,7 +385,16 @@ def pytest_runtest_setup(item):
         except Exception:
             pass
 
-        _functions_pool = discover_all_functions()
+        # Exclude libdebugger's own runtime so the plugin doesn't try to
+        # instrument the very machinery it relies on. Instrumenting
+        # ``libdebugger.manager.*`` causes infinite recursion (the plugin
+        # calls install_program/uninstall_program every rotation); the
+        # bytecode helpers in ``libdebugger.bytecode`` are called from
+        # inside the redirector and instrumenting them would corrupt the
+        # wrapping path itself.
+        _functions_pool = discover_all_functions(
+            exclude_modules={"libdebugger.manager", "libdebugger.bytecode"}
+        )
 
         if not _functions_pool:
             # No functions found, disable plugin
