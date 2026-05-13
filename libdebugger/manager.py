@@ -18,9 +18,10 @@ import logging
 from datetime import timedelta
 from typing import Callable, Dict, FrozenSet, Optional, Tuple
 
-from hogtrace import Probe, Program
+from hogtrace import Probe, Program, ProgramList
 from posthoganalytics import Posthog
 from posthoganalytics.poller import Poller
+from posthoganalytics.request import get
 
 from libdebugger.instrumentation import (
     _LOCK,
@@ -256,10 +257,16 @@ def update_program(program: Program) -> None:
 class HogTraceManager:
     """Polls PostHog for the active program list and reconciles the registry.
 
-    Phase 2 leaves ``_fetch_programs`` mostly stubbed — the HTTP body is wired
-    up in Phase 8. ``start`` / ``stop`` and logging use the module-level
-    ``logger`` instead of the previously-uncalled ``self.log_info`` /
-    ``self.log_warning``.
+    ``start`` spawns a ``posthoganalytics.poller.Poller`` that periodically
+    calls ``_fetch_programs``. ``_fetch_programs`` pulls the active
+    ``ProgramList`` from the PostHog control plane, diffs against the
+    installed-programs registry, and routes per-program changes through
+    ``install_program`` / ``uninstall_program`` / ``update_program``.
+
+    Reconcile is best-effort: any per-program operation that raises is
+    logged and skipped so a single failing program can't abort the cycle.
+    Transport / parse errors are caught around the HTTP call so they can
+    not kill the poller — the next tick simply retries.
     """
 
     client: Posthog
@@ -286,21 +293,81 @@ class HogTraceManager:
             )
             self.poller.start()
             self.enabled = True
+        else:
+            logger.warning(
+                "HogTraceManager.start called with no personal_api_key; "
+                "no poller spawned"
+            )
 
     def stop(self):
+        """Halt the poller and uninstall every currently-registered program.
+
+        Snapshot the installed program ids under ``_LOCK``, release the lock,
+        and only then iterate per-program ``uninstall_program`` calls.
+        ``uninstall_program`` re-acquires ``_LOCK`` itself; since ``_LOCK`` is
+        a non-reentrant ``threading.Lock``, holding it across the loop would
+        deadlock on the very first iteration. The "snapshot under lock, then
+        release, then iterate" pattern is the design's lock-discipline
+        invariant for batch operations.
+        """
         if self.poller:
             self.poller.stop()
-        # Phase 8 will wire reconcile-to-empty-state into stop(). Phase 2 simply
-        # halts the poller; wrapper self-uninstall remains driven by the empty
-        # registry check.
+        with _LOCK:
+            pids = list(_instr_module._INSTALLED_PROGRAMS)
+        for pid in pids:
+            try:
+                uninstall_program(pid)
+            except Exception:
+                logger.exception("Failed to uninstall program %s during stop", pid)
         self.enabled = False
 
     def _fetch_programs(self):
-        """Fetch active programs and reconcile. HTTP body lands in Phase 8."""
+        """Fetch the active ``ProgramList`` and reconcile against the registry.
+
+        Diff semantics:
+          * ids that left the incoming set get ``uninstall_program``.
+          * new ids get ``install_program``.
+          * ids present in both with a changed ``Program.hash`` get
+            ``update_program``.
+
+        Per-program operation failures are caught and logged so a single bad
+        program does not abort the entire reconcile cycle. The next poll
+        tick will retry the failed program.
+
+        Transport and parse errors are caught around the whole HTTP+decode
+        step so the poller keeps spinning across transient outages.
+        """
         if not self.client.personal_api_key:
             logger.warning("No personal API key; skipping fetch")
             return
-        # Phase 8 implementation: parse ProgramList, diff against
-        # _instr_module._INSTALLED_PROGRAMS, route to install_program / uninstall_program /
-        # update_program. For Phase 2 we leave the body empty so the poller
-        # can still spin without raising.
+        try:
+            resp = get(
+                self.client.personal_api_key,
+                "/api/projects/@current/live_debugger/programs/active",
+                self.client.host,
+                timeout=10,
+            )
+            incoming = {p.id: p for p in ProgramList.from_bytes(resp.content).programs}
+        except Exception:
+            logger.exception("Failed to fetch programs")
+            return
+
+        current_ids = set(_instr_module._INSTALLED_PROGRAMS)
+        incoming_ids = set(incoming)
+
+        for pid in current_ids - incoming_ids:
+            try:
+                uninstall_program(pid)
+            except Exception:
+                logger.exception("Failed to uninstall program %s", pid)
+        for pid in incoming_ids - current_ids:
+            try:
+                install_program(incoming[pid])
+            except Exception:
+                logger.exception("Failed to install program %s", pid)
+        for pid in current_ids & incoming_ids:
+            try:
+                if _instr_module._INSTALLED_PROGRAMS[pid].hash != incoming[pid].hash:
+                    update_program(incoming[pid])
+            except Exception:
+                logger.exception("Failed to update program %s", pid)

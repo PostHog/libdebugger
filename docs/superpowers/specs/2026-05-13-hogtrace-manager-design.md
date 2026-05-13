@@ -348,13 +348,20 @@ Errors during reconcile must not kill the poller. Any per-program install/uninst
 def stop(self) -> None:
     if self.poller:
         self.poller.stop()
+    # Snapshot the installed program ids under _LOCK, then release the lock
+    # before iterating. uninstall_program acquires _LOCK itself and the lock
+    # is a non-reentrant threading.Lock — holding it across the loop would
+    # deadlock the very first uninstall.
     with _LOCK:
-        for pid in list(_INSTALLED_PROGRAMS):
-            uninstall_program(pid)
+        pids = list(_INSTALLED_PROGRAMS)
+    for pid in pids:
+        uninstall_program(pid)
     self.enabled = False
 ```
 
 Clears the registry; wrappers self-clean on next call. No global "kill every wrapper now" hook in v1.
+
+The "snapshot under lock, release, iterate" pattern is load-bearing — both `uninstall_program` and `_rebuild_probe_index` re-acquire `_LOCK`, and the design's lock invariant ("no nesting") means `stop()` must drop the lock between the snapshot and the per-program uninstall calls.
 
 ## Function resolution (`resolve_target`)
 
