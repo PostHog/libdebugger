@@ -38,9 +38,10 @@ def test_specifiers_pool_resolves():
             obj = getattr(obj, attr)
 
 
-def test_programs_strategy_produces_program():
-    """``strategies.programs().example()`` returns a ``hogtrace.Program``."""
-    example = strategies.programs().example()
+@given(strategies.programs())
+@settings(max_examples=5, deadline=None)
+def test_programs_strategy_produces_program(example):
+    """``strategies.programs()`` yields ``hogtrace.Program`` instances."""
     assert isinstance(example, Program), f"got {type(example).__name__}"
     assert example.id, "program should have a non-empty id"
     assert len(example.probes) >= 1, "program should have at least one probe"

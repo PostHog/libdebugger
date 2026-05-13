@@ -32,15 +32,10 @@ _SPECIFIER_POOL = [
 _TARGETS = ("entry", "exit")
 
 
-def specifiers() -> st.SearchStrategy[str]:
-    """Pick a qualname from the hardcoded pool of target functions."""
-    return st.sampled_from(_SPECIFIER_POOL)
-
-
 @st.composite
 def _probe_blocks(draw) -> str:
     """One probe block like ``fn:test.target.fn_a:entry { capture(x=1); }``."""
-    spec = draw(specifiers())
+    spec = draw(st.sampled_from(_SPECIFIER_POOL))
     target = draw(st.sampled_from(_TARGETS))
     # Keep the capture body trivial - we just need a syntactically valid probe
     # so the manager has something to attach. Real capture semantics are
@@ -70,7 +65,10 @@ def programs(draw, probes_max: int = 4) -> Program:
 
 
 def program_lists(max_size: int = 5) -> st.SearchStrategy[list[Program]]:
-    """Lists of programs with distinct IDs."""
+    """Lists of programs with distinct IDs.
+
+    May produce an empty list (``min_size`` defaults to 0).
+    """
     return st.lists(
         programs(),
         max_size=max_size,

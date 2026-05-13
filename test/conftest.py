@@ -25,6 +25,10 @@ import pytest
 import libdebugger.instrumentation as instr
 from test import target as target_module
 
+# Attribute name attached to instrumented callables. Locks in the convention
+# that production code (Phase 2+) will need to match.
+POSTHOG_DECORATOR_ATTR = "__posthog_decorator"
+
 
 @pytest.fixture(autouse=True)
 def reset_state():
@@ -44,31 +48,31 @@ def reset_state():
 
     # 2. Walk the target module and tear down any lingering decorators. We
     #    iterate over a snapshot of ``vars()`` because cleanup may mutate the
-    #    namespace (deleting ``__posthog_decorator`` from a function).
+    #    namespace (deleting POSTHOG_DECORATOR_ATTR from a function).
     for name, obj in list(vars(target_module).items()):
         # Plain functions.
-        if hasattr(obj, "__posthog_decorator"):
-            dec = obj.__posthog_decorator
+        if hasattr(obj, POSTHOG_DECORATOR_ATTR):
+            dec = getattr(obj, POSTHOG_DECORATOR_ATTR)
             try:
                 dec.cleanup()
             except Exception:
                 pass
             try:
-                del obj.__posthog_decorator
+                delattr(obj, POSTHOG_DECORATOR_ATTR)
             except AttributeError:
                 pass
 
         # Methods on classes - walk class dicts one level deep.
         if isinstance(obj, type):
             for _mname, mobj in list(vars(obj).items()):
-                if hasattr(mobj, "__posthog_decorator"):
-                    dec = mobj.__posthog_decorator
+                if hasattr(mobj, POSTHOG_DECORATOR_ATTR):
+                    dec = getattr(mobj, POSTHOG_DECORATOR_ATTR)
                     try:
                         dec.cleanup()
                     except Exception:
                         pass
                     try:
-                        del mobj.__posthog_decorator
+                        delattr(mobj, POSTHOG_DECORATOR_ATTR)
                     except AttributeError:
                         pass
 
