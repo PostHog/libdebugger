@@ -11,7 +11,7 @@ callers.
 from __future__ import annotations
 
 import importlib
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import hypothesis.strategies as st
 import pytest
@@ -30,7 +30,7 @@ from hypothesis.stateful import (
 import libdebugger.instrumentation as instr
 import libdebugger.manager as manager
 from libdebugger.instrumentation import InstrumentationDecorator
-from test.strategies import programs as programs_strategy
+from test.strategies import _SPECIFIER_POOL, programs as programs_strategy
 
 
 def test_imports_clean():
@@ -634,6 +634,199 @@ def test_uninstall_unknown_program_id_is_silent():
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 — Self-cleanup convergence (P4)
+# ---------------------------------------------------------------------------
+#
+# Property: after uninstalling every program targeting function F and then
+# calling F once, hasattr(F, '__posthog_decorator') is False AND
+# F.__code__ is original_code_for_F.
+#
+# Production-side support already landed in Phase 1 (self-uninstall block in
+# InstrumentationDecorator.__call__'s finally, plus the name-mangling fix
+# for delattr). These tests just cover the property end-to-end.
+
+
+def test_self_cleanup_after_uninstall(hogtrace_scope):
+    """Install -> uninstall -> call: wrapper self-cleans on next invocation.
+
+    After uninstall_program but before the next call, the wrapper still
+    sits on the function (cleanup is lazy). The call triggers the
+    self-uninstall path in InstrumentationDecorator.__call__'s finally,
+    after which both the marker attribute and the bytecode mutation are
+    gone.
+    """
+    from libdebugger.manager import install_program, uninstall_program
+
+    original_code = target_mod.fn_a.__code__
+
+    program = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="prog-p4-1",
+    )
+    install_program(program)
+
+    # Wrapper exists, bytecode is mutated to the redirector.
+    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert target_mod.fn_a.__code__ is not original_code
+
+    uninstall_program("prog-p4-1")
+
+    # Cleanup is lazy: no call yet, so wrapper still on the function.
+    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+        "self-cleanup must be lazy: wrapper survives uninstall until next call"
+    )
+
+    # First call after the registry emptied: self-uninstall fires.
+    target_mod.fn_a(1)
+
+    assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
+        "P4: wrapper must self-clean on the next call after registry empties"
+    )
+    assert target_mod.fn_a.__code__ is original_code, (
+        "P4: __code__ must be restored to original after self-cleanup"
+    )
+
+
+def test_self_cleanup_after_uninstall_via_update_with_different_target(hogtrace_scope):
+    """Multi-program shared-function cleanup is keyed on per-qualname probe count.
+
+    Program A and Program B both target fn_a (different program ids).
+    Uninstall A: B still has a probe on fn_a, so the wrapper must NOT
+    self-clean. Uninstall B: now NO probes target fn_a, so the next call
+    self-cleans.
+    """
+    from libdebugger.manager import install_program, uninstall_program
+
+    original_code = target_mod.fn_a.__code__
+
+    prog_a = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="prog-a-share",
+    )
+    prog_b = _build_program(
+        "fn:test.target.fn_a:exit { capture(x=2); }",
+        program_id="prog-b-share",
+    )
+    install_program(prog_a)
+    install_program(prog_b)
+
+    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+
+    # Uninstall A only — B still has probes on fn_a.
+    uninstall_program("prog-a-share")
+    target_mod.fn_a(0)
+
+    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+        "wrapper must persist while ANY program still targets the function"
+    )
+    assert target_mod.fn_a.__code__ is not original_code
+
+    # Now uninstall B — registry slot for fn_a is empty.
+    uninstall_program("prog-b-share")
+    target_mod.fn_a(0)
+
+    assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
+        "wrapper must self-clean once no program targets the function"
+    )
+    assert target_mod.fn_a.__code__ is original_code
+
+
+def test_self_cleanup_does_not_fire_during_update(hogtrace_scope):
+    """update_program(B) with B.id == A.id: probes never go to zero across
+    the swap, so the wrapper must not self-clean.
+
+    The Phase 1 path defines update as uninstall + install, which means
+    there's a brief window where the registry slot for the target may be
+    empty. But the test never CALLS the function during that window, so
+    the lazy self-cleanup never fires. The wrapper must still be in
+    place after the update completes.
+    """
+    from libdebugger.manager import install_program, update_program
+
+    original_code = target_mod.fn_a.__code__
+
+    prog_a = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="prog-upd",
+    )
+    install_program(prog_a)
+    dec_before = target_mod.fn_a.__posthog_decorator
+
+    # Replace A with B at the same id (same target qualname).
+    prog_b = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=2); }",
+        program_id="prog-upd",
+    )
+    update_program(prog_b)
+
+    # Probes still exist for fn_a (now belonging to B). Wrapper persists.
+    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+        "wrapper must persist across update — probes still exist on the target"
+    )
+    # And a call doesn't dislodge it, because the registry still has B's probes.
+    target_mod.fn_a(0)
+    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+        "wrapper must persist across update + call — B still has probes"
+    )
+    assert target_mod.fn_a.__code__ is not original_code
+
+    # The decorator instance may be the same or a new one; we only assert
+    # functional convergence (probes fire), not identity preservation across
+    # update. (Phase 2's test_install_program_creates_wrapper_only_once asserts
+    # identity preservation for back-to-back installs; update_program currently
+    # goes through uninstall+install and we don't promise wrapper identity
+    # across the swap.)
+    _ = dec_before  # silence unused-name lint
+
+
+def test_self_cleanup_preserves_other_wrappers(hogtrace_scope):
+    """Cleanup is per-function. Uninstall affecting fn_b doesn't disturb fn_a.
+
+    Install program A on fn_a AND program B on fn_b. Uninstall B. Call
+    both functions: fn_a's wrapper stays (probes still there); fn_b's
+    wrapper cleans up.
+    """
+    from libdebugger.manager import install_program, uninstall_program
+
+    original_a = target_mod.fn_a.__code__
+    original_b = target_mod.fn_b.__code__
+
+    prog_a = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="prog-pres-a",
+    )
+    prog_b = _build_program(
+        "fn:test.target.fn_b:entry { capture(x=2); }",
+        program_id="prog-pres-b",
+    )
+    install_program(prog_a)
+    install_program(prog_b)
+
+    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert hasattr(target_mod.fn_b, "__posthog_decorator")
+
+    uninstall_program("prog-pres-b")
+
+    # Both still wrapped at this point (no calls yet).
+    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert hasattr(target_mod.fn_b, "__posthog_decorator")
+
+    # Call both. fn_a's probe persists -> stays wrapped. fn_b is orphaned
+    # -> cleans up.
+    target_mod.fn_a(0)
+    target_mod.fn_b(0, 0)
+
+    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+        "fn_a's wrapper must persist — its probe is still registered"
+    )
+    assert target_mod.fn_a.__code__ is not original_a
+    assert not hasattr(target_mod.fn_b, "__posthog_decorator"), (
+        "fn_b's wrapper must self-clean — its probe was uninstalled"
+    )
+    assert target_mod.fn_b.__code__ is original_b
+
+
+# ---------------------------------------------------------------------------
 # Stateful machine — Hypothesis explores arbitrary install/uninstall/update
 # sequences and checks the P2/P3 invariants after every step.
 # ---------------------------------------------------------------------------
@@ -681,6 +874,49 @@ def _drain_registry():
                         pass
 
 
+# Deterministic arg providers for each specifier in _SPECIFIER_POOL. Used by
+# the stateful machine's call_function rule — Hypothesis strategies inside a
+# @rule body would re-roll on each call (or fail to draw at all) so we use
+# plain Python literals instead. The values are arbitrary but valid for each
+# target's signature.
+_CALL_ARGS_BY_SPECIFIER: Dict[str, Tuple[Any, ...]] = {
+    "test.target.fn_a": (1,),
+    "test.target.fn_b": (1, 2),
+    "test.target.fn_c": ("x",),
+    "test.target.fn_d": ([1, 2, 3],),
+    "test.target.fn_e": (),
+    "test.target.Klass.method": (3,),
+    # fact(0) returns 1 with no recursion; small + safe.
+    "test.target.fact": (3,),
+}
+
+
+def _resolve_target_or_none(specifier: str):
+    """Resolve a specifier to its current live callable, or None.
+
+    Used inside the stateful machine's call_function rule to look up the
+    function object whose ``__posthog_decorator`` attribute we want to
+    check after the call. We use manager.resolve_target so the lookup
+    semantics match production exactly.
+    """
+    return manager.resolve_target(specifier)
+
+
+def _any_qualname_probed_in_index(qualname: str) -> bool:
+    """True iff any entry/exit/line slot for ``qualname`` carries probes.
+
+    Mirrors instrumentation._any_probes_for but reads through the test's
+    own snapshot of _PROBE_INDEX so the assertion is independent of the
+    production helper under test.
+    """
+    index = instr._PROBE_INDEX
+    return bool(
+        index.get((qualname, "entry"))
+        or index.get((qualname, "exit"))
+        or index.get((qualname, "line"))
+    )
+
+
 class RegistryMachine(RuleBasedStateMachine):
     """Stateful property test: install / uninstall / update + invariants.
 
@@ -689,6 +925,14 @@ class RegistryMachine(RuleBasedStateMachine):
     friendly and Hypothesis deepcopies bundle contents during shrinking.
     Storing ids only sidesteps the problem entirely — we re-fetch the
     live program from ``_INSTALLED_PROGRAMS`` inside each rule body.
+
+    Phase 4 extension: ``call_function`` rule plus per-step P4 assertion
+    ("wrapper IFF probes for this qualname"). Because the wrapper's probe
+    path needs an active hogtrace request scope (``get_store()`` returns
+    None outside one and probes silently skip), the machine enters a
+    request scope in ``__init__`` and exits it in ``teardown``. Using one
+    scope per example is sufficient — probes fire normally and the scope
+    is torn down between Hypothesis examples.
     """
 
     program_ids = Bundle("program_ids")
@@ -702,6 +946,13 @@ class RegistryMachine(RuleBasedStateMachine):
         # Hypothesis runs many examples per pytest case; drain anything
         # left over from a previous round.
         _drain_registry()
+
+        # Enter a hogtrace request scope so call_function's wrapped-function
+        # invocations actually fire probes (get_store() returns the scope's
+        # store, not None). new_context() returns a context manager; we
+        # invoke __enter__ here and __exit__ in teardown.
+        self._ctx = new_context()
+        self._ctx.__enter__()
 
     @rule(target=program_ids, program=programs_strategy())
     def install(self, program):
@@ -724,6 +975,63 @@ class RegistryMachine(RuleBasedStateMachine):
         manager.update_program(program)
         self._model[program.id] = program
         return program.id
+
+    @rule(specifier=st.sampled_from(_SPECIFIER_POOL))
+    def call_function(self, specifier):
+        """Call a target function once; assert wrapped IFF probed for it.
+
+        This is the P4 convergence probe. After the call:
+          - If probes exist for ``specifier`` in _PROBE_INDEX, the wrapper
+            must still be in place (``__posthog_decorator`` present).
+          - If no probes exist for ``specifier``, the call must have
+            triggered self-uninstall (``__posthog_decorator`` absent AND
+            ``__code__`` restored to the original).
+
+        The assertion runs INSIDE the rule rather than as a global
+        ``@invariant`` because the "wrapper still in place but registry
+        empty" state is legal BETWEEN an uninstall rule and the next
+        call_function rule. Only after the call do we expect convergence.
+        """
+        fn = _resolve_target_or_none(specifier)
+        if fn is None:
+            # Specifier doesn't resolve (shouldn't happen for fixed pool,
+            # but guard anyway so the rule can't blow up the machine).
+            return
+
+        # Snapshot original code if the function isn't currently wrapped,
+        # so we can check __code__ is the original after a self-uninstall.
+        # When wrapped, fn.__code__ is the redirector; the original code
+        # is stored on the decorator.
+        dec_before = getattr(fn, "__posthog_decorator", None)
+        original_code = (
+            dec_before.original_code if dec_before is not None else fn.__code__
+        )
+
+        args = _CALL_ARGS_BY_SPECIFIER[specifier]
+        try:
+            fn(*args)
+        except Exception:
+            # Probe path is allowed to log+swallow; user-code exceptions
+            # from target functions (none of ours raise on these args, but
+            # belt-and-suspenders) propagate through the wrapper and we
+            # catch them here so the machine keeps marching.
+            pass
+
+        # P4 convergence: wrapper present IFF probes exist for this qualname.
+        has_attr = hasattr(fn, "__posthog_decorator")
+        has_probes = _any_qualname_probed_in_index(specifier)
+        assert has_attr == has_probes, (
+            f"P4 convergence violated after calling {specifier}: "
+            f"hasattr(__posthog_decorator)={has_attr}, "
+            f"has_probes_in_index={has_probes}. Wrapper must exist IFF probes do."
+        )
+
+        # And on the false-side, __code__ must be back to the original.
+        if not has_attr:
+            assert fn.__code__ is original_code, (
+                f"P4 convergence: after self-cleanup for {specifier}, "
+                f"__code__ must be the original code object"
+            )
 
     @rule(target=program_ids, existing_id=program_ids, program=programs_strategy())
     def install_overwriting(self, existing_id, program):
@@ -784,6 +1092,12 @@ class RegistryMachine(RuleBasedStateMachine):
         # state leaks across rounds and the very first invariant check
         # of round N+1 can fail on round N's residue.
         _drain_registry()
+        # Exit the hogtrace request scope set up in __init__. Swallow
+        # any exception to keep teardown idempotent and resilient.
+        try:
+            self._ctx.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 # Hypothesis defaults are usually fine; we bump max_examples a bit because
