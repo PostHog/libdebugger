@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "flask>=3.0",
     "libdebugger",
+    "python-dotenv>=1.0",
     # hogtrace is pulled transitively by libdebugger.
 ]
 

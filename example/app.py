@@ -27,17 +27,26 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict
 
-from flask import Flask, g, jsonify, request
+from dotenv import load_dotenv
 
-import libdebugger
-from libdebugger import instrumentation as _instr
-from libdebugger.manager import HogTraceManager
-from hogtrace.context import new_context
+# Load .env BEFORE reading any POSTHOG_* env vars below. Looks for a
+# .env file next to this app.py so the path is stable regardless of CWD.
+# Existing process env wins (override=False) — a shell-level export
+# still beats whatever's in the file.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
-import probes
-import services
+from flask import Flask, g, jsonify, request  # noqa: E402
+
+import libdebugger  # noqa: E402
+from libdebugger import instrumentation as _instr  # noqa: E402
+from libdebugger.manager import HogTraceManager  # noqa: E402
+from hogtrace.context import new_context  # noqa: E402
+
+import probes  # noqa: E402
+import services  # noqa: E402
 
 
 logging.basicConfig(
