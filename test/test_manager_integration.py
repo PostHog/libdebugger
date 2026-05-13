@@ -4,7 +4,7 @@ Integration tests for ``HogTraceManager``'s top-level wiring (Phase 8).
 These tests exercise the end-to-end manager surface — ``_fetch_programs``,
 ``start``, ``stop`` — while stubbing out the HTTP transport. We build real
 ``ProgramList`` payloads with hogtrace's Python constructor, serialize via
-``to_bytes()``, and feed them through a mocked ``posthoganalytics.request.get``.
+``to_bytes()``, and feed them through a mocked ``requests.get``.
 
 Kept separate from ``test_manager_property.py`` so the property suite (which
 focuses on install/uninstall/update invariants) stays self-contained.
@@ -41,6 +41,17 @@ def _make_client(personal_api_key="test-key", host="https://test.local"):
     return SimpleNamespace(personal_api_key=personal_api_key, host=host)
 
 
+def _fake_response(content: bytes, status_code: int = 200):
+    """Build a stand-in for ``requests.Response`` with the attrs the
+    manager touches (``content`` + ``raise_for_status``)."""
+
+    def _raise():
+        if status_code >= 400:
+            raise Exception(f"HTTP {status_code}")
+
+    return SimpleNamespace(content=content, raise_for_status=_raise)
+
+
 # ---------------------------------------------------------------------------
 # _fetch_programs — happy path
 # ---------------------------------------------------------------------------
@@ -58,13 +69,14 @@ def test_fetch_programs_populates_registry(monkeypatch):
     )
     payload = _make_program_list_bytes([prog_a, prog_b])
 
-    def fake_get(api_key, url, host, timeout=None):
-        assert api_key == "test-key"
-        assert host == "https://test.local"
+    def fake_get(url, *, headers=None, timeout=None):
+        assert "https://test.local" in url
         assert "live_debugger/programs/active" in url
-        return SimpleNamespace(content=payload)
+        assert headers is not None
+        assert headers.get("Authorization") == "Bearer test-key"
+        return _fake_response(payload)
 
-    monkeypatch.setattr(manager, "get", fake_get)
+    monkeypatch.setattr(manager.requests, "get", fake_get)
 
     mgr = HogTraceManager(_make_client())
     mgr._fetch_programs()
@@ -85,7 +97,7 @@ def test_fetch_programs_survives_http_error(monkeypatch, caplog):
     def fake_get(*args, **kwargs):
         raise Exception("network down")
 
-    monkeypatch.setattr(manager, "get", fake_get)
+    monkeypatch.setattr(manager.requests, "get", fake_get)
 
     caplog.set_level(logging.ERROR, logger="libdebugger.manager")
 
@@ -101,9 +113,9 @@ def test_fetch_programs_survives_bad_payload(monkeypatch, caplog):
     stays exactly as it was before the call.
     """
     monkeypatch.setattr(
-        manager,
+        manager.requests,
         "get",
-        lambda *a, **k: SimpleNamespace(content=b"\x00\x01\x02junk"),
+        lambda *a, **k: _fake_response(b"\x00\x01\x02junk"),
     )
 
     caplog.set_level(logging.ERROR, logger="libdebugger.manager")
@@ -137,7 +149,7 @@ def test_fetch_programs_reconciles_uninstalls(monkeypatch):
     )
     payload = _make_program_list_bytes([new_prog])
     monkeypatch.setattr(
-        manager, "get", lambda *a, **k: SimpleNamespace(content=payload)
+        manager.requests, "get", lambda *a, **k: _fake_response(payload)
     )
 
     mgr = HogTraceManager(_make_client())
@@ -174,7 +186,7 @@ def test_fetch_programs_reconciles_hash_change(monkeypatch):
 
     payload = _make_program_list_bytes([prog_b])
     monkeypatch.setattr(
-        manager, "get", lambda *a, **k: SimpleNamespace(content=payload)
+        manager.requests, "get", lambda *a, **k: _fake_response(payload)
     )
 
     mgr = HogTraceManager(_make_client())
@@ -248,7 +260,7 @@ def test_fetch_programs_no_api_key_does_not_call_get(monkeypatch):
         calls.append((args, kwargs))
         raise AssertionError("get() should not be called without a key")
 
-    monkeypatch.setattr(manager, "get", tracking_get)
+    monkeypatch.setattr(manager.requests, "get", tracking_get)
 
     client = SimpleNamespace(personal_api_key=None, host="https://test.local")
     mgr = HogTraceManager(client)

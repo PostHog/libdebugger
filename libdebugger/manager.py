@@ -18,10 +18,11 @@ import logging
 from datetime import timedelta
 from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
 
+import requests
+
 from hogtrace import Probe, Program, ProgramList
 from posthoganalytics import Posthog
 from posthoganalytics.poller import Poller
-from posthoganalytics.request import get
 
 from libdebugger.instrumentation import (
     _LOCK,
@@ -361,12 +362,25 @@ class HogTraceManager:
             logger.warning("No personal API key; skipping fetch")
             return
         try:
-            resp = get(
-                self.client.personal_api_key,
-                "/api/projects/@current/live_debugger/programs/active",
-                self.client.host,
+            # Use requests directly: the endpoint returns
+            # `application/octet-stream` (ProgramList protobuf bytes), and
+            # `posthoganalytics.request.get` insists on JSON-parsing the
+            # response which would blow up on the binary payload.
+            host = (self.client.host or "").rstrip("/")
+            url = host + "/api/projects/@current/live_debugger/programs/active"
+            resp = requests.get(
+                url,
+                headers={
+                    "Authorization": "Bearer " + self.client.personal_api_key,
+                    # Intentionally no Accept header. DRF's content-
+                    # negotiation rejects explicit ``application/octet-
+                    # stream`` (its default renderers don't list it) and
+                    # returns 406 before the view even runs. The view
+                    # always returns octet-stream regardless of Accept.
+                },
                 timeout=10,
             )
+            resp.raise_for_status()
             incoming = {p.id: p for p in ProgramList.from_bytes(resp.content).programs}
         except Exception:
             logger.exception("Failed to fetch programs")
