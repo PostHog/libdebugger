@@ -383,24 +383,18 @@ def test_exit_probe_fires_on_exception(hogtrace_scope, capture_enqueue):
     with pytest.raises(ValueError, match="boom"):
         target_mod.fn_raises()
 
-    # Exit probe was attempted. We don't assert on captures here because
-    # the hogtrace VM may or may not return them depending on predicate state;
-    # the property under test is that _enqueue_message was reached at least
-    # once for the exit probe — OR that execute_probe ran (which is what
-    # _run_probes actually tries). We sample for at least one entry in the
-    # call log; if captures is None _run_probes won't enqueue. So we settle
-    # for "_enqueue_message was reached".
-    #
-    # If the call list ends up empty, the cause is one of:
-    #   (a) execute_probe returned None (predicate not matched, etc.).
-    #   (b) the wrapper failed to take the exit-probe path.
-    # (b) is the failure mode this test targets — we accept (a) as a wash
-    # by also confirming via a non-raising sibling test below.
-    #
-    # We assert that *if* anything was enqueued, it was the exit probe.
-    for prog, probe, _captures in capture_enqueue:
-        assert prog is program
-        assert probe.spec.target == "exit"
+    # The failure mode this test targets is "wrapper never takes the
+    # exit-probe path on exception". A vacuous pass (no calls at all) would
+    # hide that bug, so assert the call count BEFORE iterating and confirm
+    # the single call is in fact the exit probe.
+    assert len(capture_enqueue) == 1, (
+        f"exit probe must fire once on exception, got {len(capture_enqueue)} fires"
+    )
+    prog, probe, _captures = capture_enqueue[0]
+    assert prog is program
+    assert probe.spec.target == "exit", (
+        f"the firing probe must be the exit probe, got target={probe.spec.target}"
+    )
 
 
 def test_entry_fires_once_on_exception(hogtrace_scope, capture_enqueue):

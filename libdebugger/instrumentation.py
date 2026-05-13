@@ -76,6 +76,11 @@ def _run_probes(
         try:
             req_store = get_store()
             if req_store is None:
+                logger.debug(
+                    "no hogtrace request scope; skipping probe %s for program %s",
+                    probe.id,
+                    program.id,
+                )
                 continue
             store = req_store.for_program(program_id=program.id)
             captures = execute_probe(
@@ -334,10 +339,12 @@ class InstrumentationDecorator:
             # ``except AttributeError`` would silently swallow the failure.
             # The string literal escapes mangling.
             #
-            # TODO(phase-2): wrap this cleanup block in the proper lock
-            # discipline once we reason through reentrancy with live
-            # probes. Phase 1 is single-threaded test setups so the
-            # existing ``self._lock`` is sufficient.
+            # TODO(phase-7): revisit reentrancy under concurrent calls —
+            # the threaded-stress phase needs to validate that the
+            # registry-empty check + self.cleanup() + delattr sequence
+            # is safe when another thread is mid-``__call__`` on the
+            # same wrapper. The Phase 2 spec validates the locking under
+            # serial execution; Phase 7's job is the concurrent case.
             entry_now = _PROBE_INDEX.get((self.qualname, "entry"), ())
             if not entry_now and not exit_ and not self._installed_line_probes:
                 with self._lock:

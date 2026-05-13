@@ -93,8 +93,8 @@ def resolve_target(specifier: str) -> Optional[Callable]:
         if not ok:
             continue
         if not callable(obj):
-            # Found the attribute path but it isn't callable; keep looking
-            # is pointless (longer prefixes already imported) — return None.
+            # Found the attribute path but the terminal isn't callable.
+            # Shorter prefixes can't reach a different terminal, so stop.
             return None
         return obj
 
@@ -210,19 +210,20 @@ def install_program(program: Program) -> None:
 
 
 def uninstall_program(program_id: str) -> None:
-    """Remove ``program_id`` from the registry. Wrappers self-clean on next call.
+    """Stub: raises NotImplementedError until Phase 3 lands.
 
-    Phase 3 will implement this fully. For Phase 2 we stub it as a
-    "not yet supported" so tests that need it skip cleanly.
+    Phase 3 will implement: remove ``program_id`` from ``_INSTALLED_PROGRAMS``,
+    rebuild ``_PROBE_INDEX``, and let wrappers self-clean on next call.
     """
     raise NotImplementedError("uninstall_program lands in Phase 3")
 
 
 def update_program(program: Program) -> None:
-    """Replace an installed program with ``program``.
+    """Stub: raises NotImplementedError until Phase 3 lands.
 
-    Defined per the spec as ``uninstall_program(program.id); install_program(program)``.
-    Phase 3 lands ``uninstall_program``; this function is a stub until then.
+    Phase 3 will implement the spec definition
+    ``uninstall_program(program.id); install_program(program)`` once
+    ``uninstall_program`` is real.
     """
     raise NotImplementedError("update_program lands in Phase 3")
 
