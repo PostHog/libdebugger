@@ -38,7 +38,7 @@ _INSTALLED_PROGRAMS: Dict[str, Any] = {}
 
 # (qualname, "entry" | "exit" | "line") -> tuple of (Program, Probe).
 # Atomic-rebound; never mutated in place. Hot-path reads are lock-free.
-_PROBE_INDEX: Dict[Tuple[str, str], Tuple[Tuple[Any, Any], ...]] = {}
+_PROBE_INDEX: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
 
 
 def _any_probes_for(qualname: str) -> bool:
@@ -182,11 +182,7 @@ class InstrumentationDecorator:
     ) -> None:
         # Bound methods: unwrap to the underlying function so the
         # bytecode redirect lands on the class-level function object.
-        self._is_bound_method = False
-        self._method_self: Any = None
         if inspect.ismethod(fn):
-            self._is_bound_method = True
-            self._method_self = fn.__self__  # type: ignore
             fn = fn.__func__  # type: ignore
 
         self.qualname = qualname
@@ -328,13 +324,27 @@ class InstrumentationDecorator:
             # ``__posthog_decorator``. The ``delattr`` is wrapped in
             # try/except so explicit test-driven setup doesn't crash on
             # the lazy cleanup path.
+            #
+            # NOTE: We MUST use ``delattr(..., "__posthog_decorator")``
+            # rather than ``del self.wrapped_fn.__posthog_decorator``.
+            # Inside a class body Python applies name-mangling to dunder
+            # (double-underscore) prefixes — the attribute access would
+            # be rewritten to ``_InstrumentationDecorator__posthog_decorator``
+            # which never matches the attribute the caller set, and the
+            # ``except AttributeError`` would silently swallow the failure.
+            # The string literal escapes mangling.
+            #
+            # TODO(phase-2): wrap this cleanup block in the proper lock
+            # discipline once we reason through reentrancy with live
+            # probes. Phase 1 is single-threaded test setups so the
+            # existing ``self._lock`` is sufficient.
             entry_now = _PROBE_INDEX.get((self.qualname, "entry"), ())
             if not entry_now and not exit_ and not self._installed_line_probes:
                 with self._lock:
                     if not _any_probes_for(self.qualname):
                         self.cleanup()
                         try:
-                            del self.wrapped_fn.__posthog_decorator
+                            delattr(self.wrapped_fn, "__posthog_decorator")
                         except AttributeError:
                             pass
 
@@ -370,10 +380,34 @@ def _build_instrumented(
         decorator.wrapped_fn.__defaults__,
         decorator.wrapped_fn.__closure__,
     )
-    # Preserve keyword-only defaults so signatures with kw-only args
-    # behave identically to the original.
+
+    # Preserve metadata so ``instrumented_fn`` is indistinguishable from
+    # the original under introspection:
+    #
+    #   - ``__kwdefaults__``: kw-only default values; required for the
+    #     instrumented function to accept the same keyword-only args.
+    #   - ``__qualname__``: dotted name shown in tracebacks and reprs;
+    #     without it stack traces lose the class/qualified context.
+    #   - ``__module__``: used by logging/repr to locate where the
+    #     function was defined.
+    #   - ``__doc__``: preserved so ``help()`` and tooling that reads
+    #     docstrings keep working.
+    #   - ``__annotations__``: preserved so type-introspection tools
+    #     (``typing.get_type_hints``, IDEs) see the same annotations.
+    #   - ``__wrapped__``: pointed at ``wrapped_fn`` so ``inspect.unwrap()``
+    #     and any ``functools.wraps``-style introspection can walk back
+    #     to the original function object.
     if hasattr(decorator.wrapped_fn, "__kwdefaults__"):
         fn.__kwdefaults__ = decorator.wrapped_fn.__kwdefaults__
+    if hasattr(decorator.wrapped_fn, "__qualname__"):
+        fn.__qualname__ = decorator.wrapped_fn.__qualname__
+    if hasattr(decorator.wrapped_fn, "__module__"):
+        fn.__module__ = decorator.wrapped_fn.__module__
+    if hasattr(decorator.wrapped_fn, "__doc__"):
+        fn.__doc__ = decorator.wrapped_fn.__doc__
+    if hasattr(decorator.wrapped_fn, "__annotations__"):
+        fn.__annotations__ = decorator.wrapped_fn.__annotations__
+    fn.__wrapped__ = decorator.wrapped_fn  # type: ignore[attr-defined]
     return fn
 
 

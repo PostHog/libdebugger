@@ -110,7 +110,13 @@ def test_wrap_unwrap_preserves_behavior(fn_getter, qualname, args_strategy):
 
     Compute expected from the uninstrumented function, wrap with the
     decorator (qualname-only constructor — registry is empty), call the
-    wrapped function and assert equality, then unwrap and call again.
+    wrapped function TWICE and assert equality, then unwrap and call again.
+
+    The double call matters: a degenerate wrapper that restores the
+    original on the first invocation and forwards thereafter would pass
+    a single-call equality check. Calling twice catches that class of
+    failure (and is also what triggers the self-uninstall path in the
+    real wrapper, which we want exercised here).
     """
     fn = fn_getter()
 
@@ -127,7 +133,10 @@ def test_wrap_unwrap_preserves_behavior(fn_getter, qualname, args_strategy):
         try:
             fn.__posthog_decorator = InstrumentationDecorator(fn, qualname=qualname)
 
-            # 3. Wrapped call equals expected.
+            # 3. Wrapped call equals expected. Call twice — catches
+            # "wrapper degrades after first call" failures and exercises
+            # the self-uninstall path on the second invocation.
+            assert fn(*args) == expected
             assert fn(*args) == expected
         finally:
             # 4. Unwrap and confirm post-unwrap behavior also matches.
@@ -144,6 +153,10 @@ def test_wrap_unwrap_preserves_exception():
 
     No probe-side effects to consider in Phase 1; the registry is empty,
     so the wrapper's only job is to faithfully forward the exception.
+
+    The wrapped function is raised+caught TWICE while wrapped so the
+    second raise proves the wrapper still raises correctly even if the
+    self-uninstall path fired during the first call.
     """
 
     # Add a function that raises. We define it locally so the
@@ -160,6 +173,8 @@ def test_wrap_unwrap_preserves_exception():
         fn_raises, qualname="test.local.fn_raises"
     )
     try:
+        with pytest.raises(ValueError, match="boom"):
+            fn_raises()
         with pytest.raises(ValueError, match="boom"):
             fn_raises()
     finally:
@@ -190,6 +205,47 @@ def test_wrap_unwrap_method_on_class():
 
     # And post-unwrap.
     assert klass_instance.method(3) == expected_3
+
+
+def test_self_uninstall_removes_marker_attribute():
+    """Regression test: self-uninstall must remove ``__posthog_decorator``.
+
+    Prior to the fix, ``InstrumentationDecorator.__call__`` used
+    ``del self.wrapped_fn.__posthog_decorator`` inside the class body.
+    Python name-mangling rewrites that to
+    ``_InstrumentationDecorator__posthog_decorator`` which never matches
+    the attribute the caller set, so the ``except AttributeError`` path
+    silently swallowed the failure and the marker attribute survived.
+
+    With ``_PROBE_INDEX`` empty (Phase 1 default), the first call to a
+    wrapped function takes the self-uninstall branch; afterward the
+    function must no longer carry the marker.
+    """
+    fn = target_mod.fn_a
+
+    # Sanity preconditions.
+    assert not hasattr(fn, "__posthog_decorator"), (
+        "test invariant: fn must not be pre-wrapped"
+    )
+    assert instr._PROBE_INDEX == {}, (
+        "test invariant: registry must be empty so self-uninstall fires"
+    )
+
+    fn.__posthog_decorator = InstrumentationDecorator(fn, qualname="test.target.fn_a")
+    try:
+        assert hasattr(fn, "__posthog_decorator")
+
+        # First (and only) call: registry is empty, so __call__'s finally
+        # block should take the self-uninstall branch and delete the
+        # marker attribute via ``delattr(..., "__posthog_decorator")``.
+        fn(1)
+
+        assert not hasattr(fn, "__posthog_decorator"), (
+            "self-uninstall should have removed the marker attribute "
+            "(name-mangling regression)"
+        )
+    finally:
+        _unwrap(fn)
 
 
 def test_module_globals_present():

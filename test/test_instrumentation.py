@@ -15,9 +15,49 @@ from hogtrace.context import new_context, get_scope
 #
 # The tests below exercised the deleted API. Skip them at module scope;
 # Phase 2's property-test coverage replaces them.
+#
+# CHECKLIST — what these skipped tests covered, for the Phase 2+ port:
+#
+#   * Entry-probe firing end-to-end (TestInstrumentationDecorator.
+#     test_basic_capture): verifies a single entry probe captures a
+#     named argument and emits a $hogtrace_capture event with the right
+#     program_id / probe_id / context_id / probe_spec / captures payload
+#     and the metadata fields (timestamp, thread_id, thread_name).
+#   * Entry + exit probe interaction over multiple calls
+#     (test_number_of_calls): two functions, three probes wired across
+#     them, counts the right number of capture() invocations and
+#     verifies $req-scoped state (count) accumulates correctly across
+#     calls within a single context.
+#   * Context isolation (test_number_of_calls_isolation): the same
+#     program packaged twice, two contexts, three calls per context;
+#     verifies $req state is per-context and per-program, that conditional
+#     exit probes (``/ $req.count == 3 /``) fire only when matched, and
+#     that captures preserve object identity through the probe path.
+#   * Bytecode-level structural coverage (commented-out hypothesis tests
+#     and the structural_test_function fixture): branches, while/for
+#     loops with break/continue/else, try/except/else/finally, nested
+#     try, lambdas, nested defs, generators, with-statements (single
+#     and multi-context), conditional expressions, *args/**kwargs flow,
+#     chained comparisons, recursive functions, factory functions
+#     returning closures, and global writes. These exercised
+#     ``instrument_function_at_line`` / ``reset_function`` on the
+#     PRE-rewrite API; Phase 2+ should port the same diversity onto the
+#     new property-test harness once line probes land.
+#   * Early-return interaction (test_early_return /
+#     test_early_return_not_taken): line-probe at a line that may or
+#     may not be reached depending on branch taken — fires once or not
+#     at all.
+#   * Closure handling (test_instrumentation_in_closure): instrumenting
+#     a closure-producing function should NOT leak instrumentation into
+#     pre-existing closures after reset; only newly-produced closures
+#     should be clean.
+#   * Reset round-trip property (test_reset): after instrumenting then
+#     resetting any sequence of lines, ``__code__`` is bit-identical to
+#     the original.
 pytestmark = pytest.mark.skip(
     reason="Phase 2+: probes via _PROBE_INDEX registry, not wrapper state. "
-    "Replaced by test_manager_property.py from Phase 1 onward."
+    "Replaced by test_manager_property.py from Phase 1 onward. "
+    "See module-level checklist above for the categories to re-cover."
 )
 
 
