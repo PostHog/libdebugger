@@ -22,7 +22,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-hogtrace = { git = "https://github.com/PostHog/hogtrace", branch = "feat/programlist-python-construct" }
+hogtrace = { git = "https://github.com/PostHog/hogtrace" }
 
 [project.entry-points.pytest11]
 libdebugger_stress = "libdebugger.pytest_stress"
