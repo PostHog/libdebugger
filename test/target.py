@@ -61,3 +61,15 @@ def fact(n):
 def fn_raises():
     """Always raises ``ValueError("boom")``. Used to exercise exit-probe-on-exception."""
     raise ValueError("boom")
+
+
+def recur_raise(n: int) -> int:
+    """Recurses to depth ``n`` then raises ``ValueError`` at the base case.
+
+    Used by P6 (recursion safety) tests to verify that exit probes fire on
+    every level of the recursion that was entered, even though the unwind
+    happens under an exception. The function never returns normally.
+    """
+    if n <= 0:
+        raise ValueError("recur_raise base case")
+    return recur_raise(n - 1)

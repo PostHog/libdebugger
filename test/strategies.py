@@ -27,6 +27,7 @@ _SPECIFIER_POOL = [
     "test.target.Klass.method",
     "test.target.fact",
     "test.target.fn_raises",
+    "test.target.recur_raise",
 ]
 
 
