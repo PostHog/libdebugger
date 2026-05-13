@@ -11,7 +11,7 @@ callers.
 from __future__ import annotations
 
 import importlib
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Tuple
 
 import hypothesis.strategies as st
 import pytest
@@ -1103,6 +1103,229 @@ class RegistryMachine(RuleBasedStateMachine):
             self._ctx.__exit__(None, None, None)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Order-independence (P5)
+# ---------------------------------------------------------------------------
+#
+# Property: for any permutation of a fixed multiset of install / uninstall /
+# update operations that ends in the same final program set, the resulting
+# ``_PROBE_INDEX`` is identical. In other words: ``_PROBE_INDEX`` is a pure
+# function of ``_INSTALLED_PROGRAMS``.
+#
+# This is a structural consequence of ``_rebuild_probe_index`` iterating
+# ``_INSTALLED_PROGRAMS`` afresh on every reconcile — so no production-code
+# changes are expected. The tests below pin the property so a future
+# refactor that introduces order-sensitivity gets caught immediately.
+
+
+def _normalized_index() -> Dict[Tuple[str, str], FrozenSet[Tuple[str, str]]]:
+    """Map each ``_PROBE_INDEX`` slot to a frozenset of ``(program.id, probe.id)``.
+
+    Strips order-of-iteration noise so two semantically-equivalent indexes
+    compare equal. For P5 specifically we want set-equality on slot contents
+    — the stronger "order-stable within a slot" property is a separate
+    assertion and outside Phase 5's scope.
+    """
+    return {
+        key: frozenset((p.id, pr.id) for p, pr in pairs)
+        for key, pairs in instr._PROBE_INDEX.items()
+    }
+
+
+def _normalize_from_programs(
+    programs: Iterable[Any],
+) -> Dict[Tuple[str, str], FrozenSet[Tuple[str, str]]]:
+    """Compute the normalized index that ``_rebuild_probe_index`` would produce
+    given just an iterable of Programs (no reliance on the live registry).
+
+    Used by the optional ``index_matches_model_rebuild`` invariant to assert
+    that the actual ``_PROBE_INDEX`` agrees with a fresh rebuild from the
+    test's own model dict, regardless of operation history.
+    """
+    out: Dict[Tuple[str, str], set] = {}
+    for program in programs:
+        for probe in program.probes:
+            key = (probe.spec.specifier, probe.spec.target)
+            out.setdefault(key, set()).add((program.id, probe.id))
+    return {key: frozenset(pairs) for key, pairs in out.items()}
+
+
+def test_probe_index_is_pure_function_of_installed_programs(hogtrace_scope):
+    """Four operation sequences converging on the same final program set
+    must produce the same ``_PROBE_INDEX``.
+
+    Sequences exercised:
+      A: install P1, install P2, install P3.
+      B: install P3, install P1, install P2.        (different order)
+      C: install P1, install P2, install P3,
+         uninstall P1, install P1.                  (transient removal)
+      D: install P1, install P2, install P3,
+         install P2 (overwrite at same id).         (overwrite path)
+
+    All four end with ``{P1.id, P2.id, P3.id}`` installed, so the normalized
+    ``_PROBE_INDEX`` views must coincide.
+    """
+
+    def _drain() -> None:
+        for pid in list(instr._INSTALLED_PROGRAMS):
+            manager.uninstall_program(pid)
+
+    # Use distinct specifiers so each program contributes a distinct slot —
+    # makes test failures easier to diagnose (you can tell which slot
+    # diverged).
+    p1 = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="p5-p1",
+    )
+    p2 = _build_program(
+        "fn:test.target.fn_b:entry { capture(x=2); }",
+        program_id="p5-p2",
+    )
+    p3 = _build_program(
+        "fn:test.target.fn_c:exit { capture(x=3); }",
+        program_id="p5-p3",
+    )
+
+    # Sequence A: canonical install order.
+    _drain()
+    manager.install_program(p1)
+    manager.install_program(p2)
+    manager.install_program(p3)
+    index_a = _normalized_index()
+
+    # Sequence B: reversed install order.
+    _drain()
+    manager.install_program(p3)
+    manager.install_program(p1)
+    manager.install_program(p2)
+    index_b = _normalized_index()
+
+    # Sequence C: install all, transiently uninstall p1, reinstall p1.
+    _drain()
+    manager.install_program(p1)
+    manager.install_program(p2)
+    manager.install_program(p3)
+    manager.uninstall_program("p5-p1")
+    manager.install_program(p1)
+    index_c = _normalized_index()
+
+    # Sequence D: install p1, p2, p3 then overwrite p2 with itself (same id,
+    # same payload). install_program is documented to overwrite a same-id
+    # install, so the registry ends up with the SAME three programs.
+    _drain()
+    manager.install_program(p1)
+    manager.install_program(p2)
+    manager.install_program(p3)
+    manager.install_program(p2)
+    index_d = _normalized_index()
+
+    # All four sequences must converge to the same normalized index.
+    assert index_a == index_b, f"A vs B diverged. A={index_a!r} B={index_b!r}"
+    assert index_a == index_c, f"A vs C diverged. A={index_a!r} C={index_c!r}"
+    assert index_a == index_d, f"A vs D diverged. A={index_a!r} D={index_d!r}"
+
+    # Sanity: the converged index is non-trivial (each program contributed
+    # one slot). Guards against a vacuous-equality bug where every sequence
+    # somehow ended up with an empty registry.
+    assert set(index_a.keys()) == {
+        ("test.target.fn_a", "entry"),
+        ("test.target.fn_b", "entry"),
+        ("test.target.fn_c", "exit"),
+    }
+
+
+@given(data=st.data())
+@hyp_settings(max_examples=30, deadline=None)
+def test_probe_index_pure_function_of_program_set(data):
+    """Hypothesis-driven: for any program set, two different install orders
+    yield the same ``_PROBE_INDEX``.
+
+    Strategy:
+      1. Draw a list of programs with distinct ids.
+      2. Draw a Hypothesis-controlled permutation of that list — so any
+         failure is deterministically replayable.
+      3. Install in original order; snapshot normalized index as ``A``.
+      4. Drain. Install in shuffled order; snapshot normalized index as ``B``.
+      5. Assert ``A == B``.
+
+    The drain step is essential — Hypothesis runs many examples in one
+    pytest case and we need a clean slate between sequences.
+
+    We enter the hogtrace request scope inside the body (not via a
+    function-scoped fixture) because Hypothesis warns about fixture reuse
+    across generated inputs. ``install_program`` doesn't need an active
+    scope per se — it only registers probes — but we use one anyway so
+    the wrapper installation path is exercised in a realistic environment.
+    """
+    program_set = data.draw(
+        st.lists(
+            programs_strategy(probes_max=3),
+            min_size=1,
+            max_size=5,
+            unique_by=lambda p: p.id,
+        ),
+        label="program_set",
+    )
+    shuffled = data.draw(st.permutations(program_set), label="shuffled")
+
+    def _drain() -> None:
+        for pid in list(instr._INSTALLED_PROGRAMS):
+            manager.uninstall_program(pid)
+
+    with new_context():
+        # Sequence A: install in the order the strategy produced.
+        _drain()
+        for p in program_set:
+            manager.install_program(p)
+        index_a = _normalized_index()
+
+        # Sequence B: install in the shuffled order.
+        _drain()
+        for p in shuffled:
+            manager.install_program(p)
+        index_b = _normalized_index()
+
+        assert index_a == index_b, (
+            f"_PROBE_INDEX depends on install order. "
+            f"original={[p.id for p in program_set]} "
+            f"shuffled={[p.id for p in shuffled]} "
+            f"index_a={index_a!r} index_b={index_b!r}"
+        )
+
+        # Final-state hygiene: drain so subsequent Hypothesis examples (and
+        # the autouse ``reset_state`` fixture) start clean.
+        _drain()
+
+
+# Optional stronger invariant on the existing stateful machine:
+# the actual ``_PROBE_INDEX`` must equal what a fresh rebuild from the
+# model dict would produce. This is strictly stronger than the existing
+# ``index_consistent`` + ``all_installed_probes_in_index`` invariants
+# because it also catches a divergent slot that's STRUCTURALLY present
+# but holds an unexpected ``(program_id, probe_id)`` set.
+def _index_matches_model_rebuild_invariant(self):
+    """Invariant: actual _PROBE_INDEX == rebuild from the model.
+
+    Captures order-independence (P5) by asserting that whatever sequence
+    of operations the stateful machine just performed, the result equals
+    a from-scratch rebuild over the test's mirror of the registry.
+    """
+    expected = _normalize_from_programs(self._model.values())
+    actual = _normalized_index()
+    assert expected == actual, (
+        f"_PROBE_INDEX diverged from model rebuild. "
+        f"expected={expected!r} actual={actual!r}"
+    )
+
+
+# Attach as an invariant on the class. Using @invariant() as a decorator
+# inline on the method would have been cleaner but the machine is already
+# defined above; this avoids duplicating it.
+RegistryMachine.index_matches_model_rebuild = invariant()(
+    _index_matches_model_rebuild_invariant
+)
 
 
 # Hypothesis defaults are usually fine; we bump max_examples a bit because
