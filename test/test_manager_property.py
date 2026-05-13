@@ -750,7 +750,6 @@ def test_self_cleanup_does_not_fire_during_update(hogtrace_scope):
         program_id="prog-upd",
     )
     install_program(prog_a)
-    dec_before = target_mod.fn_a.__posthog_decorator
 
     # Replace A with B at the same id (same target qualname).
     prog_b = _build_program(
@@ -770,13 +769,8 @@ def test_self_cleanup_does_not_fire_during_update(hogtrace_scope):
     )
     assert target_mod.fn_a.__code__ is not original_code
 
-    # The decorator instance may be the same or a new one; we only assert
-    # functional convergence (probes fire), not identity preservation across
-    # update. (Phase 2's test_install_program_creates_wrapper_only_once asserts
-    # identity preservation for back-to-back installs; update_program currently
-    # goes through uninstall+install and we don't promise wrapper identity
-    # across the swap.)
-    _ = dec_before  # silence unused-name lint
+    # Note: update_program is uninstall + install, so decorator identity is
+    # not asserted across the swap — only that the wrapper attribute survives.
 
 
 def test_self_cleanup_preserves_other_wrappers(hogtrace_scope):
@@ -888,7 +882,18 @@ _CALL_ARGS_BY_SPECIFIER: Dict[str, Tuple[Any, ...]] = {
     "test.target.Klass.method": (3,),
     # fact(0) returns 1 with no recursion; small + safe.
     "test.target.fact": (3,),
+    # fn_raises always raises; the call_function rule swallows the
+    # exception and still verifies P4 convergence under the raise path.
+    "test.target.fn_raises": (),
 }
+
+# Drift guard: every specifier in the strategy pool must have an entry in
+# the call-args map. If you add a new target to _SPECIFIER_POOL, also add
+# its args to _CALL_ARGS_BY_SPECIFIER below.
+assert set(_CALL_ARGS_BY_SPECIFIER.keys()) == set(_SPECIFIER_POOL), (
+    f"specifier drift between _CALL_ARGS_BY_SPECIFIER and _SPECIFIER_POOL: "
+    f"map={set(_CALL_ARGS_BY_SPECIFIER)}, pool={set(_SPECIFIER_POOL)}"
+)
 
 
 def _resolve_target_or_none(specifier: str):
