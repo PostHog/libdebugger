@@ -1,9 +1,24 @@
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from libdebugger.instrumentation import InstrumentationDecorator
 from hogtrace.vm import compile, package
 from hogtrace.context import new_context, get_scope
+
+# Phase 1 of the hogtrace-manager rewrite (see docs/superpowers/specs/
+# 2026-05-13-hogtrace-manager-design.md) removed the
+# ``entry_probes``/``exit_probes`` constructor parameters and the
+# ``add_probe``/``remove_probe`` methods from ``InstrumentationDecorator``.
+# Probes now live in a module-level registry that Phase 2 fills.
+#
+# The tests below exercised the deleted API. Skip them at module scope;
+# Phase 2's property-test coverage replaces them.
+pytestmark = pytest.mark.skip(
+    reason="Phase 2+: probes via _PROBE_INDEX registry, not wrapper state. "
+    "Replaced by test_manager_property.py from Phase 1 onward."
+)
 
 
 def structural_test_function(x, y=5, *args, **kwargs):
