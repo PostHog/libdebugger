@@ -226,7 +226,7 @@ wheels = [
 [[package]]
 name = "hogtrace"
 version = "0.2.0"
-source = { git = "https://github.com/PostHog/hogtrace#35cb0db828e2305d1fd40c5d73c10db19aef30a7" }
+source = { git = "https://github.com/PostHog/hogtrace?branch=feat%2Fprogramlist-python-construct#1d557517558ad2260278bb87fe53d931d39e69c0" }
 
 [[package]]
 name = "hypothesis"
@@ -403,7 +403,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "bytecode", specifier = ">=0.17.0" },
-    { name = "hogtrace", git = "https://github.com/PostHog/hogtrace" },
+    { name = "hogtrace", git = "https://github.com/PostHog/hogtrace?branch=feat%2Fprogramlist-python-construct" },
     { name = "jsonpickle", specifier = ">=4.1.1" },
     { name = "posthoganalytics", specifier = ">=6.7.4" },
 ]
