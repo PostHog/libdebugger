@@ -237,3 +237,21 @@ def test_start_with_no_api_key_does_not_poll():
     assert mgr.poller is None
     # And calling stop() on a never-started manager is a no-op.
     mgr.stop()
+
+
+def test_fetch_programs_no_api_key_does_not_call_get(monkeypatch):
+    """Without a personal API key, _fetch_programs must early-return
+    without touching the HTTP layer."""
+    calls: list[tuple] = []
+
+    def tracking_get(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("get() should not be called without a key")
+
+    monkeypatch.setattr(manager, "get", tracking_get)
+
+    client = SimpleNamespace(personal_api_key=None, host="https://test.local")
+    mgr = HogTraceManager(client)
+    mgr._fetch_programs()  # must not raise
+
+    assert calls == [], f"get() should not have been called; got {calls}"

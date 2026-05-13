@@ -352,6 +352,12 @@ class HogTraceManager:
             logger.exception("Failed to fetch programs")
             return
 
+        # NB: these reads are not under _LOCK. That's safe because:
+        # (a) the poller is single-threaded so there's no concurrent reconcile, and
+        # (b) install_program / uninstall_program / update_program each acquire
+        #     _LOCK themselves for their own mutation, so the inconsistency window
+        #     is bounded by individual ops, not by the whole loop.
+        # If we ever run multiple reconcilers concurrently this needs to change.
         current_ids = set(_instr_module._INSTALLED_PROGRAMS)
         incoming_ids = set(incoming)
 
