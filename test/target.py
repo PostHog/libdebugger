@@ -56,3 +56,8 @@ def fact(n):
     if n <= 1:
         return 1
     return n * fact(min(n - 1, 100))
+
+
+def fn_raises():
+    """Always raises ``ValueError("boom")``. Used to exercise exit-probe-on-exception."""
+    raise ValueError("boom")

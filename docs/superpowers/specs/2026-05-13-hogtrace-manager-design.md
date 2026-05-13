@@ -272,25 +272,37 @@ def update_program(program: Program) -> None:
 
 ### `_rebuild_probe_index`
 
-Walks `_INSTALLED_PROGRAMS`, builds a fresh `Dict[(qualname, target), Tuple[(Program, Probe), ...]]`, atomic-rebinds the global. **Important:** when the contents for a given key are unchanged from the previous index, reuse the *existing tuple object* so that line-probe identity-compare in the wrapper's hot path stays stable. Implementation:
+Walks `_INSTALLED_PROGRAMS`, builds a fresh `Dict[(qualname, target), Tuple[(Program, Probe), ...]]`, atomic-rebinds the global. **Important:** when the contents for a given key are unchanged from the previous index, reuse the *existing tuple object* so that line-probe identity-compare in the wrapper's hot path stays stable.
+
+**Equality nuance.** `hogtrace.Program` and `hogtrace.Probe` are PyO3 wrappers that don't implement `__eq__`; comparing them with `==` falls back to identity. Worse, `program.probes` returns a fresh list of fresh `Probe` wrapper objects on every access, so even reading "the same probe" twice in a row gives you two non-equal objects. Comparing two tuples of `(Program, Probe)` pairs with `==` therefore *always* returns False, which would defeat the tuple-reuse optimization.
+
+The workaround: compare by stable identifiers — `(program.id, probe.id)` — collected into a `frozenset` per slot. If the new slot's identity set equals the previous slot's identity set, reuse the previous tuple.
 
 ```python
 def _rebuild_probe_index() -> None:
     global _PROBE_INDEX
     prev = _PROBE_INDEX
     new_raw: Dict[Tuple[str, str], List[Tuple[Program, Probe]]] = {}
+    new_ids: Dict[Tuple[str, str], FrozenSet[Tuple[str, str]]] = {}
     for program in _INSTALLED_PROGRAMS.values():
         for probe in program.probes:
-            qualname = _qualname_for_specifier(probe.spec.specifier)
-            target = probe.spec.target   # "entry" | "exit" | "line"
-            new_raw.setdefault((qualname, target), []).append((program, probe))
+            key = (_qualname_for_specifier(probe.spec.specifier), probe.spec.target)
+            new_raw.setdefault(key, []).append((program, probe))
+            new_ids.setdefault(key, set()).add((program.id, probe.id))
+    new_ids = {k: frozenset(v) for k, v in new_ids.items()}
 
     new_index: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
     for key, pairs in new_raw.items():
-        new_tuple = tuple(pairs)
-        existing = prev.get(key)
-        new_index[key] = existing if existing == new_tuple else new_tuple
+        prev_tuple = prev.get(key)
+        if prev_tuple is not None and _slot_ids(prev_tuple) == new_ids[key]:
+            new_index[key] = prev_tuple          # reuse — identity stable for drift detection
+        else:
+            new_index[key] = tuple(pairs)
     _PROBE_INDEX = new_index
+
+
+def _slot_ids(slot: Tuple[Tuple[Program, Probe], ...]) -> FrozenSet[Tuple[str, str]]:
+    return frozenset((program.id, probe.id) for program, probe in slot)
 ```
 
 ### `HogTraceManager._fetch_programs`
