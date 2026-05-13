@@ -18,9 +18,19 @@ import pytest
 from hogtrace.context import new_context
 from hogtrace.vm import compile as ht_compile, package as ht_package
 from hypothesis import given, settings
+from hypothesis import settings as hyp_settings
+from hypothesis.stateful import (
+    Bundle,
+    RuleBasedStateMachine,
+    consumes,
+    invariant,
+    rule,
+)
 
 import libdebugger.instrumentation as instr
+import libdebugger.manager as manager
 from libdebugger.instrumentation import InstrumentationDecorator
+from test.strategies import programs as programs_strategy
 
 
 def test_imports_clean():
@@ -523,6 +533,35 @@ def test_resolve_target_returns_none_for_module():
     assert resolve_target("test.target") is None
 
 
+def test_rebuild_probe_index_reuses_tuple_when_unchanged():
+    """When _rebuild_probe_index produces the same content, it reuses the prior tuple object.
+
+    This is load-bearing for Phase 6: the wrapper's hot path identity-compares
+    line-probe tuples to detect drift. If _rebuild_probe_index always builds
+    a new tuple even when content is unchanged, identity-compare fires on
+    every reconcile and we rebuild instrumented_fn unnecessarily.
+    """
+    from libdebugger.manager import install_program, _rebuild_probe_index
+
+    program = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="prog-stable",
+    )
+    install_program(program)
+
+    snapshot_a = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
+
+    # Rebuild from the same _INSTALLED_PROGRAMS state — contents unchanged.
+    with instr._LOCK:
+        _rebuild_probe_index()
+
+    snapshot_b = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
+
+    assert snapshot_a is snapshot_b, (
+        "tuple objects must be reused when contents are unchanged"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 — Registry & index consistency (P2, P3)
 # ---------------------------------------------------------------------------
@@ -600,20 +639,6 @@ def test_uninstall_unknown_program_id_is_silent():
 # ---------------------------------------------------------------------------
 
 
-from hypothesis import settings as hyp_settings  # noqa: E402
-from hypothesis.stateful import (  # noqa: E402
-    Bundle,
-    RuleBasedStateMachine,
-    consumes,
-    invariant,
-    rule,
-)
-
-from test.strategies import programs as programs_strategy  # noqa: E402
-
-import libdebugger.manager as manager  # noqa: E402
-
-
 def _drain_registry():
     """Tear down everything in the registry plus any lingering wrappers.
 
@@ -623,10 +648,9 @@ def _drain_registry():
     between Hypothesis examples.
     """
     for pid in list(instr._INSTALLED_PROGRAMS):
-        try:
-            manager.uninstall_program(pid)
-        except Exception:
-            pass
+        # No broad except: uninstall_program is the function under test;
+        # swallowing exceptions here would hide real regressions.
+        manager.uninstall_program(pid)
 
     # Also tear down any wrapper still attached to a target function. The
     # production code leaves these in place until next-call self-cleanup;
@@ -701,6 +725,21 @@ class RegistryMachine(RuleBasedStateMachine):
         self._model[program.id] = program
         return program.id
 
+    @rule(target=program_ids, existing_id=program_ids, program=programs_strategy())
+    def install_overwriting(self, existing_id, program):
+        # Exercises the same-id collision path that the random-UUID
+        # strategy in strategies.programs() would otherwise virtually never
+        # hit. ``existing_id`` is a non-consuming read of the bundle (no
+        # ``consumes(...)`` wrap) — its value flows back into the bundle
+        # via ``target=program_ids`` so the id stays drawable by other
+        # rules. We re-package the freshly-generated program with that
+        # existing id so install_program takes the overwrite branch.
+        forged = ht_package(existing_id, program.program_bytecode)
+        manager.install_program(forged)
+        # Mirror in the model: same id, new probes -> dict overwrite.
+        self._model[existing_id] = forged
+        return existing_id
+
     @invariant()
     def registry_consistent(self):
         # P2: the set of installed program ids matches the model exactly.
@@ -721,6 +760,24 @@ class RegistryMachine(RuleBasedStateMachine):
                     f"program {program.id!r} not in _INSTALLED_PROGRAMS"
                 )
 
+    @invariant()
+    def all_installed_probes_in_index(self):
+        """Converse of index_consistent: every probe of every installed
+        program must be reflected in _PROBE_INDEX[(qualname, target)].
+
+        A bug in _rebuild_probe_index that silently dropped probes from
+        one program would pass the other two invariants — this catches it.
+        """
+        for program in instr._INSTALLED_PROGRAMS.values():
+            for probe in program.probes:
+                key = (probe.spec.specifier, probe.spec.target)
+                pairs = instr._PROBE_INDEX.get(key, ())
+                ids_in_slot = frozenset((p.id, pr.id) for p, pr in pairs)
+                assert (program.id, probe.id) in ids_in_slot, (
+                    f"probe {probe.id} of program {program.id} not in "
+                    f"_PROBE_INDEX[{key}]; slot had {ids_in_slot}"
+                )
+
     def teardown(self):
         # Run between Hypothesis examples; the autouse ``reset_state``
         # fixture only fires between pytest test cases. Without this,
@@ -739,32 +796,3 @@ RegistryMachine.TestCase.settings = hyp_settings(
 )
 
 TestRegistry = RegistryMachine.TestCase
-
-
-def test_rebuild_probe_index_reuses_tuple_when_unchanged():
-    """When _rebuild_probe_index produces the same content, it reuses the prior tuple object.
-
-    This is load-bearing for Phase 6: the wrapper's hot path identity-compares
-    line-probe tuples to detect drift. If _rebuild_probe_index always builds
-    a new tuple even when content is unchanged, identity-compare fires on
-    every reconcile and we rebuild instrumented_fn unnecessarily.
-    """
-    from libdebugger.manager import install_program, _rebuild_probe_index
-
-    program = _build_program(
-        "fn:test.target.fn_a:entry { capture(x=1); }",
-        program_id="prog-stable",
-    )
-    install_program(program)
-
-    snapshot_a = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
-
-    # Rebuild from the same _INSTALLED_PROGRAMS state — contents unchanged.
-    with instr._LOCK:
-        _rebuild_probe_index()
-
-    snapshot_b = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
-
-    assert snapshot_a is snapshot_b, (
-        "tuple objects must be reused when contents are unchanged"
-    )

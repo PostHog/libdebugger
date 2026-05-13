@@ -212,6 +212,10 @@ def install_program(program: Program) -> None:
 def uninstall_program(program_id: str) -> None:
     """Remove ``program_id`` from the registry and rebuild ``_PROBE_INDEX``.
 
+    Silent no-op on unknown ``program_id``: this is what makes
+    reconcile-diff loops cheap — the caller can issue uninstall for any
+    id that disappeared from a new fetch without checking first.
+
     Side effects under ``_LOCK``:
       1. ``_instr_module._INSTALLED_PROGRAMS.pop(program_id, None)`` —
          silently no-op when the id was never installed.
@@ -230,6 +234,10 @@ def uninstall_program(program_id: str) -> None:
 
 def update_program(program: Program) -> None:
     """Replace any existing install of ``program.id`` with ``program``.
+
+    Calling on a program whose id is not currently installed is
+    equivalent to ``install_program(program)`` — the leading uninstall
+    is a silent no-op.
 
     Defined as ``uninstall_program(program.id); install_program(program)``.
     Each call grabs ``_LOCK`` separately — we MUST NOT hold the lock
