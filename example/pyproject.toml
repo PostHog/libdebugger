@@ -1,0 +1,13 @@
+[project]
+name = "libdebugger-flask-example"
+version = "0.0.1"
+description = "Tiny Flask app for iterating on libdebugger end-to-end."
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0",
+    "libdebugger",
+    # hogtrace is pulled transitively by libdebugger.
+]
+
+[tool.uv.sources]
+libdebugger = { path = "..", editable = true }

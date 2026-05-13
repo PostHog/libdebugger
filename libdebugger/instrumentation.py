@@ -40,6 +40,33 @@ _INSTALLED_PROGRAMS: Dict[str, Any] = {}
 # Atomic-rebound; never mutated in place. Hot-path reads are lock-free.
 _PROBE_INDEX: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
 
+# Pluggable destination for probe-capture events. The signature is
+# ``sink(event_name: str, properties: Dict[str, Any]) -> None``. By
+# default this is ``None`` — captures are dropped (with a debug log)
+# until something registers a sink. ``HogTraceManager.__init__`` wires
+# ``client.capture`` here automatically when constructed with a client
+# that exposes that method; users wanting full control can override via
+# ``libdebugger.set_event_sink(...)``.
+_EVENT_SINK: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
+
+def set_event_sink(
+    sink: Optional[Callable[[str, Dict[str, Any]], None]],
+) -> None:
+    """Register (or clear) the callable that receives probe-capture events.
+
+    The sink is invoked as ``sink(event_name, properties)`` once per probe
+    fire. Pass ``None`` to disable event emission entirely (captures are
+    then dropped with a debug log).
+
+    This is a global setting — there is one event sink per process. The
+    normal wiring is automatic via ``HogTraceManager``; call this directly
+    only for tests, alternate sinks (queue / file / stdout), or to plug in
+    a PostHog SDK whose ``capture`` signature differs from the default.
+    """
+    global _EVENT_SINK
+    _EVENT_SINK = sink
+
 
 def _any_probes_for(qualname: str) -> bool:
     """True if any entry/exit/line probe is registered for ``qualname``."""
@@ -419,15 +446,25 @@ def _build_instrumented(
 
 
 def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]):
-    from posthoganalytics import capture
+    """Forward a probe-capture payload to the registered event sink.
+
+    No-op (with a debug log) if no sink is registered. The event name is
+    always ``$hogtrace_capture``; per-fire metadata (program / probe ids,
+    scope context, thread info, timestamp) is folded into the properties.
+    """
+    sink = _EVENT_SINK
+    if sink is None:
+        logger.debug(
+            "no event sink registered; dropping capture from probe %s",
+            probe.id,
+        )
+        return
 
     scope = get_scope()
-    assert scope is not None
-
     properties: Dict[str, Any] = {
         "program_id": program.id,
         "probe_id": probe.id,
-        "context_id": scope.context_id,
+        "context_id": scope.context_id if scope is not None else None,
         "probe_spec": serialize_probe_spec(probe.spec),
         "captures": captures,
         # "$stack_trace": stacktrace,
@@ -436,11 +473,13 @@ def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]):
         "thread_name": threading.current_thread().name,
     }
 
-    capture(
-        "$hogtrace_capture",
-        properties=properties,
-        timestamp=properties["timestamp"],
-    )
+    try:
+        sink("$hogtrace_capture", properties)
+    except Exception:
+        logger.exception(
+            "event sink raised; dropping capture from probe %s",
+            probe.id,
+        )
 
 
 def serialize_probe_spec(spec: ProbeSpec) -> Dict[str, str]:

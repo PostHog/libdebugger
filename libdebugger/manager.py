@@ -16,7 +16,7 @@ from __future__ import annotations
 import importlib
 import logging
 from datetime import timedelta
-from typing import Callable, Dict, FrozenSet, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
 
 from hogtrace import Probe, Program, ProgramList
 from posthoganalytics import Posthog
@@ -26,6 +26,7 @@ from posthoganalytics.request import get
 from libdebugger.instrumentation import (
     _LOCK,
     InstrumentationDecorator,
+    set_event_sink,
 )
 from libdebugger import instrumentation as _instr_module
 
@@ -280,6 +281,25 @@ class HogTraceManager:
         self.poll_interval = poll_interval
         self.enabled = False
         self.poller = None
+
+        # Wire the client's ``.capture`` as the event sink so probes have
+        # somewhere to send things. We accept any object with a callable
+        # ``capture`` (works with both ``posthog`` and ``posthoganalytics``
+        # SDKs, and with hand-rolled test doubles). Adapt the SDK's
+        # signature into our (event, properties) shape.
+        client_capture = getattr(client, "capture", None)
+        if callable(client_capture):
+
+            def _sink(event_name: str, properties: Dict[str, Any]) -> None:
+                client_capture(event=event_name, properties=properties)
+
+            set_event_sink(_sink)
+        else:
+            logger.warning(
+                "HogTraceManager client has no callable .capture; "
+                "probe events will be dropped until libdebugger.set_event_sink "
+                "is called",
+            )
 
     def start(self):
         if self.enabled:
