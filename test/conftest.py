@@ -46,6 +46,11 @@ def reset_state():
         if hasattr(instr, attr):
             setattr(instr, attr, {})
 
+    # 1b. Reset the global event sink so a sink registered by one test
+    #     can't leak captures into the next test's _enqueue_message path.
+    if hasattr(instr, "_EVENT_SINK"):
+        instr._EVENT_SINK = None
+
     # 2. Walk the target module and tear down any lingering decorators. We
     #    iterate over a snapshot of ``vars()`` because cleanup may mutate the
     #    namespace (deleting POSTHOG_DECORATOR_ATTR from a function).

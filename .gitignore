@@ -19,3 +19,6 @@ wheels/
 
 # Editor / OS
 .DS_Store
+
+# Local env files (the example app reads example/.env)
+.env
