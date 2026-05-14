@@ -530,3 +530,117 @@ def test_many_concurrent_reconcilers_converge():
         )
     finally:
         _drain_registry()
+
+
+# ---------------------------------------------------------------------------
+# Test: concurrent calls with both entry + exit probes — frame-stack interleaving
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_calls_entry_exit_pairing(fire_counter):
+    """N worker threads each call ``fn_a`` M times with entry + exit probes.
+
+    Verifies that under concurrent access:
+
+    * Total fires == ``N * M * 2`` — every call produces exactly one entry
+      and one exit firing.
+    * ``entry_fires == exit_fires`` exactly. If the decorator's per-thread
+      ``self.frames`` interleaving were buggy (e.g. one thread popping
+      another thread's frame and taking the "frame mismatch" branch), the
+      exit count would be short.
+    * Every call returns the correct value (behavior preservation under
+      concurrency). ``fn_a(x)`` is deterministic: ``1 + 2 + x``.
+
+    The single-thread version of this property is covered by
+    ``test_manager_probe_firing.test_entry_and_exit_both_fire_on_normal_return``;
+    this test extends it to threads sharing one wrapper.
+    """
+    program = _build_program(
+        "fn:test.target.fn_a:entry { capture(hit=1); }\n"
+        "fn:test.target.fn_a:exit { capture(hit=2); }",
+        program_id="concurrent-entry-exit",
+    )
+    manager.install_program(program)
+
+    # Sanity check: the wrapper exists and both slots are populated.
+    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert ("test.target.fn_a", "entry") in instr._PROBE_INDEX
+    assert ("test.target.fn_a", "exit") in instr._PROBE_INDEX
+
+    n_threads = 8
+    calls_per_thread = 50
+    start_barrier = threading.Barrier(n_threads)
+
+    errors: List[BaseException] = []
+    errors_lock = threading.Lock()
+    # Each worker accumulates the (input, returned) pairs it observed.
+    # Reading these post-join verifies behavior preservation: every
+    # call must have produced ``1 + 2 + x``.
+    results: List[Tuple[int, int]] = []
+    results_lock = threading.Lock()
+
+    def _worker(thread_id: int) -> None:
+        try:
+            start_barrier.wait(timeout=5.0)
+            local: List[Tuple[int, int]] = []
+            # Hogtrace scope is thread-local — each worker needs its own.
+            with new_context():
+                for i in range(calls_per_thread):
+                    x = thread_id * 1000 + i
+                    rv = target_mod.fn_a(x)
+                    local.append((x, rv))
+            with results_lock:
+                results.extend(local)
+        except BaseException as e:
+            with errors_lock:
+                errors.append(e)
+
+    threads = [
+        threading.Thread(target=_worker, args=(tid,), name=f"caller-{tid}")
+        for tid in range(n_threads)
+    ]
+
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+            if t.is_alive():
+                with errors_lock:
+                    errors.append(
+                        RuntimeError(f"thread {t.name} did not join — deadlock?")
+                    )
+
+        assert not errors, f"errors during concurrent entry+exit calls: {errors}"
+
+        total_calls = n_threads * calls_per_thread
+        assert len(results) == total_calls
+        # Every call must have returned the right value.
+        for x, rv in results:
+            assert rv == 1 + 2 + x, (
+                f"behavior corrupted under concurrency: fn_a({x}) returned {rv}"
+            )
+
+        # Each call produces exactly 2 fires (entry + exit). If exit were
+        # dropped on some calls (e.g. due to the defensive frame-mismatch
+        # branch firing because two threads raced on self.frames), this
+        # would be short.
+        assert len(fire_counter) == total_calls * 2, (
+            f"expected {total_calls * 2} fires (entry+exit per call), "
+            f"got {len(fire_counter)}"
+        )
+
+        # fire_counter records (program_id, probe_id) per fire. The
+        # program has two probes — split by id and check both counts.
+        entry_probe = next(p for p in program.probes if p.spec.target == "entry")
+        exit_probe = next(p for p in program.probes if p.spec.target == "exit")
+        entry_fires = sum(1 for pid, prid in fire_counter if prid == entry_probe.id)
+        exit_fires = sum(1 for pid, prid in fire_counter if prid == exit_probe.id)
+        assert entry_fires == total_calls, (
+            f"entry fires: expected {total_calls}, got {entry_fires}"
+        )
+        assert exit_fires == total_calls, (
+            f"exit fires: expected {total_calls}, got {exit_fires}"
+        )
+    finally:
+        _drain_registry()

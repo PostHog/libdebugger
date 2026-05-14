@@ -73,3 +73,26 @@ def recur_raise(n: int) -> int:
     if n <= 0:
         raise ValueError("recur_raise base case")
     return recur_raise(n - 1)
+
+
+def fn_kbd():
+    """Always raises ``KeyboardInterrupt``.
+
+    Exercises the wrapper's ``except BaseException`` exit-probe path. The
+    wrapper catches ``BaseException`` (not just ``Exception``) so that
+    interpreter-level signals still fire exit probes before re-raising.
+    """
+    raise KeyboardInterrupt("interrupt")
+
+
+def fn_gen(n: int = 3):
+    """Generator function. Yields ``0..n-1``.
+
+    Calling a generator function returns a generator object *without*
+    executing the body — the wrapper therefore sees a normal return whose
+    ``retval`` is the generator object, never the yielded values. Tests
+    pin this down so a future refactor that tries to "trace generator
+    bodies" knows to update the contract.
+    """
+    for i in range(n):
+        yield i
