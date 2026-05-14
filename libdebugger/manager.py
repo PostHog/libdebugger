@@ -233,6 +233,12 @@ def uninstall_program(program_id: str) -> None:
     with _LOCK:
         _instr_module._INSTALLED_PROGRAMS.pop(program_id, None)
         _rebuild_probe_index()
+    # Drop any probe-error dedupe state belonging to this program. Done
+    # outside ``_LOCK`` because the dedupe path has its own lock and we
+    # don't need atomicity-with-rebuild here — a probe firing concurrently
+    # against a stale registry entry is already a no-op once the rebuild
+    # completes.
+    _instr_module._drop_dedup_for_program(program_id)
 
 
 def update_program(program: Program) -> None:

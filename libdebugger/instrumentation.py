@@ -2,6 +2,8 @@ import datetime
 import logging
 import threading
 import sys
+import time
+import traceback
 import inspect
 from typing import Callable, Final, Optional, Dict, List, Any, Tuple
 from types import CodeType, FrameType, FunctionType
@@ -48,6 +50,82 @@ _PROBE_INDEX: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
 # that exposes that method; users wanting full control can override via
 # ``libdebugger.set_event_sink(...)``.
 _EVENT_SINK: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
+
+# ---------------------------------------------------------------------------
+# Probe-error dedupe state.
+#
+# When ``execute_probe`` raises (typically because the user's probe code
+# references something that doesn't exist on the captured frame — e.g.
+# ``arg0.id`` when ``arg0`` is an int), we want to surface the failure to
+# the developer via a ``$hogtrace_probe_error`` event so they know their
+# probe reached the target but blew up. The blast radius matters: a broken
+# probe sitting on a hot function can fail thousands of times per second,
+# and we don't want to firehose the sink with identical errors.
+#
+# Strategy: per ``(program_id, probe_id, exc_type_name)`` key, fire once
+# immediately, then suppress identical failures for ``_PROBE_ERROR_WINDOW``
+# seconds. The accumulated suppressed count rides along on the next fire
+# as ``skipped_since_last`` so the developer can see how bad it was.
+#
+# State is module-level rather than per-decorator because the same probe
+# can fire on many wrappers (e.g. a wildcard match in the future) and we
+# want one dedupe identity per logical probe.
+# ---------------------------------------------------------------------------
+
+_PROBE_ERROR_DEDUP_LOCK: threading.Lock = threading.Lock()
+
+# Key: (program_id, probe_id, exc_type_name)
+# Value: (last_fire_monotonic_ts, suppressed_count_since_last_fire)
+_PROBE_ERROR_DEDUP: Dict[Tuple[str, str, str], Tuple[float, int]] = {}
+
+# Suppression window in seconds. First failure inside this window fires;
+# subsequent identical failures are accumulated and reported on the next
+# fire after the window expires. Tests monkey-patch this for fast windows.
+_PROBE_ERROR_WINDOW: float = 60.0
+
+
+def _record_probe_error(
+    program: Program, probe: Probe, exc: BaseException
+) -> Optional[int]:
+    """Decide atomically whether to emit a probe-error event right now.
+
+    Returns the ``skipped_since_last`` count to include on the event if
+    this call should emit, or ``None`` if the call is inside the dedupe
+    window and should be suppressed.
+
+    Contract:
+      * First failure for a key: emits with ``skipped_since_last == 0``.
+      * Within window: returns None and bumps the suppressed counter.
+      * After window: emits with ``skipped_since_last == <accumulated>``
+        and resets the counter.
+    """
+    now = time.monotonic()
+    key = (program.id, probe.id, type(exc).__name__)
+    with _PROBE_ERROR_DEDUP_LOCK:
+        prev = _PROBE_ERROR_DEDUP.get(key)
+        if prev is None:
+            _PROBE_ERROR_DEDUP[key] = (now, 0)
+            return 0
+        last_fired, suppressed = prev
+        if now - last_fired >= _PROBE_ERROR_WINDOW:
+            _PROBE_ERROR_DEDUP[key] = (now, 0)
+            return suppressed
+        _PROBE_ERROR_DEDUP[key] = (last_fired, suppressed + 1)
+        return None
+
+
+def _drop_dedup_for_program(program_id: str) -> None:
+    """Remove all dedupe entries belonging to ``program_id``.
+
+    Called from the manager on ``uninstall_program`` so a stale program's
+    dedupe state doesn't linger. If the program reinstalls (e.g. after a
+    probe fix), the next failure fires immediately instead of being
+    suppressed by a window from a previous incarnation.
+    """
+    with _PROBE_ERROR_DEDUP_LOCK:
+        for key in [k for k in _PROBE_ERROR_DEDUP if k[0] == program_id]:
+            del _PROBE_ERROR_DEDUP[key]
 
 
 def set_event_sink(
@@ -120,12 +198,26 @@ def _run_probes(
             )
             if captures:
                 _enqueue_message(program, probe, captures)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Probe execution failed for program=%s probe=%s",
                 getattr(program, "id", "?"),
                 getattr(probe, "id", "?"),
             )
+            # Dedupe + surface to the developer. If the dedupe window
+            # says "suppress", we still logged above; the only visible
+            # effect of suppression is the missing PostHog event.
+            try:
+                skipped = _record_probe_error(program, probe, exc)
+                if skipped is not None:
+                    _enqueue_probe_error(program, probe, exc, skipped)
+            except Exception:
+                # The error-reporting path itself must not propagate.
+                logger.exception(
+                    "Failed to emit $hogtrace_probe_error for program=%s probe=%s",
+                    getattr(program, "id", "?"),
+                    getattr(probe, "id", "?"),
+                )
     return len(probes)
 
 
@@ -478,6 +570,66 @@ def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]):
     except Exception:
         logger.exception(
             "event sink raised; dropping capture from probe %s",
+            probe.id,
+        )
+
+
+def _enqueue_probe_error(
+    program: Program,
+    probe: Probe,
+    exc: BaseException,
+    skipped_since_last: int,
+) -> None:
+    """Forward a probe-execution failure to the registered event sink.
+
+    Emits an event named ``$hogtrace_probe_error`` carrying enough context
+    for a developer (or LLM agent) to identify *which* probe failed and
+    *why*: program / probe ids, the original probe spec (so they can grep
+    their source for the offending probe), the exception type + message,
+    and a short formatted traceback truncated to the last few frames of
+    ``execute_probe``.
+
+    ``skipped_since_last`` is the count of identical failures that were
+    suppressed by the dedupe window since this key last fired. ``0`` on
+    the very first failure for a key.
+
+    No-op (with a debug log) if no sink is registered. Sink exceptions
+    are caught here so the error-reporting path can never break user code.
+    """
+    sink = _EVENT_SINK
+    if sink is None:
+        logger.debug(
+            "no event sink registered; dropping probe-error for probe %s",
+            probe.id,
+        )
+        return
+
+    scope = get_scope()
+    # Truncate the traceback to keep payloads small. The most useful frames
+    # are the innermost (where ``execute_probe`` raised) — these come last
+    # in the formatted output by default.
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    formatted_tb = "".join(tb_lines)
+
+    properties: Dict[str, Any] = {
+        "program_id": program.id,
+        "probe_id": probe.id,
+        "context_id": scope.context_id if scope is not None else None,
+        "probe_spec": serialize_probe_spec(probe.spec),
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "traceback": formatted_tb,
+        "skipped_since_last": skipped_since_last,
+        "timestamp": datetime.datetime.now(),
+        "thread_id": threading.current_thread().ident,
+        "thread_name": threading.current_thread().name,
+    }
+
+    try:
+        sink("$hogtrace_probe_error", properties)
+    except Exception:
+        logger.exception(
+            "event sink raised; dropping probe-error for probe %s",
             probe.id,
         )
 

@@ -51,6 +51,11 @@ def reset_state():
     if hasattr(instr, "_EVENT_SINK"):
         instr._EVENT_SINK = None
 
+    # 1c. Reset probe-error dedupe state so a suppressed error from one
+    #     test can't suppress an expected fire in the next.
+    if hasattr(instr, "_PROBE_ERROR_DEDUP"):
+        instr._PROBE_ERROR_DEDUP = {}
+
     # 2. Walk the target module and tear down any lingering decorators. We
     #    iterate over a snapshot of ``vars()`` because cleanup may mutate the
     #    namespace (deleting POSTHOG_DECORATOR_ATTR from a function).
