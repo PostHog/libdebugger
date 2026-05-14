@@ -34,9 +34,11 @@ from dotenv import load_dotenv
 
 # Load .env BEFORE reading any POSTHOG_* env vars below. Looks for a
 # .env file next to this app.py so the path is stable regardless of CWD.
-# Existing process env wins (override=False) — a shell-level export
-# still beats whatever's in the file.
-load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+# override=True so the .env wins over shell-level exports — a stray
+# POSTHOG_PERSONAL_API_KEY in your shell (e.g. a project secret key
+# exported for capture testing) silently breaks the libdebugger poller
+# with 401s, which is annoying to debug.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 from flask import Flask, g, jsonify, request  # noqa: E402
 
@@ -63,6 +65,17 @@ logger = logging.getLogger("example.app")
 POSTHOG_PROJECT_KEY = os.environ.get("POSTHOG_PROJECT_API_KEY")
 POSTHOG_PERSONAL_KEY = os.environ.get("POSTHOG_PERSONAL_API_KEY")
 POSTHOG_HOST = os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com")
+
+if POSTHOG_PERSONAL_KEY and not POSTHOG_PERSONAL_KEY.startswith("phx_"):
+    # A project secret key (phs_) or project key (phc_) used here will
+    # silently 401 the poller — fail loudly instead so the operator knows
+    # which knob to turn.
+    raise RuntimeError(
+        "POSTHOG_PERSONAL_API_KEY must start with 'phx_' (personal API key). "
+        f"Got a key starting with {POSTHOG_PERSONAL_KEY[:4]!r}. "
+        "If you exported a project key in your shell for capture, "
+        "unset it before running the example."
+    )
 
 
 def _stdout_sink(event_name: str, properties: Dict[str, Any]) -> None:
