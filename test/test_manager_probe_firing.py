@@ -274,30 +274,9 @@ def test_resolve_target_returns_none_for_module():
     assert resolve_target("test.target") is None
 
 
-def test_rebuild_probe_index_reuses_tuple_when_unchanged():
-    """When _rebuild_probe_index produces the same content, it reuses the prior tuple object.
-
-    This is load-bearing for Phase 6: the wrapper's hot path identity-compares
-    line-probe tuples to detect drift. If _rebuild_probe_index always builds
-    a new tuple even when content is unchanged, identity-compare fires on
-    every reconcile and we rebuild instrumented_fn unnecessarily.
-    """
-    from libdebugger.manager import install_program, _rebuild_probe_index
-
-    program = _build_program(
-        "fn:test.target.fn_a:entry { capture(x=1); }",
-        program_id="prog-stable",
-    )
-    install_program(program)
-
-    snapshot_a = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
-
-    # Rebuild from the same _INSTALLED_PROGRAMS state — contents unchanged.
-    with instr._LOCK:
-        _rebuild_probe_index()
-
-    snapshot_b = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
-
-    assert snapshot_a is snapshot_b, (
-        "tuple objects must be reused when contents are unchanged"
-    )
+# The tuple-reuse drift-detection test that used to live here is gone —
+# the bytecode-rewriting wrapper that identity-compared probe tuples no
+# longer exists. The rebuild can (and does) build a fresh tuple every
+# time. ``test_manager_self_cleanup.py`` covers the invariant that
+# matters now: ``_PROBE_INDEX`` is a pure function of
+# ``_INSTALLED_PROGRAMS``.

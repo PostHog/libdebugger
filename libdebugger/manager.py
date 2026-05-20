@@ -24,7 +24,7 @@ import importlib
 import inspect
 import logging
 from datetime import timedelta
-from typing import Any, Callable, Dict, FrozenSet, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import requests
 from hogtrace import Probe, Program, ProgramList
@@ -98,18 +98,7 @@ def resolve_target(specifier: str) -> Optional[Callable]:
 # ---------------------------------------------------------------------------
 
 
-def _slot_ids(
-    slot: Tuple[Tuple[Program, Probe], ...],
-) -> FrozenSet[Tuple[str, str]]:
-    """Identity set of ``(program.id, probe.id)`` pairs in a slot.
-
-    Hogtrace ``Program`` / ``Probe`` lack ``__eq__``, so we compare on the
-    stable string identifiers instead.
-    """
-    return frozenset((program.id, probe.id) for program, probe in slot)
-
-
-def _rebuild_probe_index() -> None:
+def _rebuild_probe_index() -> Set[str]:
     """Rebuild the derived dispatch state from ``_INSTALLED_PROGRAMS``.
 
     Called under ``_LOCK``. Produces two derived structures from a single
@@ -124,27 +113,18 @@ def _rebuild_probe_index() -> None:
     invariants keep holding) but are filtered out of the dispatch table
     and monitoring mask — they would over-capture today, see Future-work
     in the design doc. A warning is logged once per probe id.
-    """
-    prev = _instr_module._PROBE_INDEX
 
-    new_raw: Dict[Tuple[str, str], list] = {}
-    new_ids: Dict[Tuple[str, str], set] = {}
+    Returns the set of qualnames that did not resolve so the caller can
+    log them at WARNING level without re-walking the resolver.
+    """
+    new_index: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
+    by_key: Dict[Tuple[str, str], list] = {}
     for program in _instr_module._INSTALLED_PROGRAMS.values():
         for probe in program.probes:
-            qualname = probe.spec.specifier
-            target = probe.spec.target  # "entry" | "exit" | "line"
-            key = (qualname, target)
-            new_raw.setdefault(key, []).append((program, probe))
-            new_ids.setdefault(key, set()).add((program.id, probe.id))
-
-    new_index: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
-    for key, pairs in new_raw.items():
-        new_tuple = tuple(pairs)
-        existing = prev.get(key)
-        if existing is not None and _slot_ids(existing) == frozenset(new_ids[key]):
-            new_index[key] = existing
-        else:
-            new_index[key] = new_tuple
+            key = (probe.spec.specifier, probe.spec.target)
+            by_key.setdefault(key, []).append((program, probe))
+    for key, pairs in by_key.items():
+        new_index[key] = tuple(pairs)
 
     qualname_to_resolved: Dict[str, Optional[Any]] = {}
     new_code_index: Dict[Tuple[CodeType, str], list] = {}
@@ -154,10 +134,9 @@ def _rebuild_probe_index() -> None:
         if target == "line":
             _maybe_warn_line_probes(pairs)
             continue
-        fn = qualname_to_resolved.get(qualname)
-        if fn is None and qualname not in qualname_to_resolved:
-            fn = resolve_target(qualname)
-            qualname_to_resolved[qualname] = fn
+        if qualname not in qualname_to_resolved:
+            qualname_to_resolved[qualname] = resolve_target(qualname)
+        fn = qualname_to_resolved[qualname]
         if fn is None:
             continue
         underlying = fn.__func__ if inspect.ismethod(fn) else fn
@@ -175,6 +154,8 @@ def _rebuild_probe_index() -> None:
     _instr_module._CODE_PROBE_INDEX = final_code_index
 
     _instr_module._apply_monitoring(new_codes_to_kinds)
+
+    return {q for q, fn in qualname_to_resolved.items() if fn is None}
 
 
 _LINE_PROBE_WARNED: Set[Tuple[str, str]] = set()
@@ -210,26 +191,24 @@ def install_program(program: Program) -> None:
          candidate ``sys.monitoring`` slot is already owned by another tool),
          the registry stays untouched — otherwise a future reconcile sees
          the program as ``current`` and never retries.
-      2. ``_INSTALLED_PROGRAMS[program.id] = program``.
+      2. ``_INSTALLED_PROGRAMS[program.id] = program`` (overwrites any
+         existing entry at the same id, so this is also the update path).
       3. ``_rebuild_probe_index`` rebuilds the qualname / code dispatch
-         tables and applies the ``sys.monitoring`` event-mask diff.
+         tables, applies the ``sys.monitoring`` event-mask diff, and
+         returns the set of unresolved qualnames so we can log them.
 
-    Per-probe target resolution happens inside the rebuild's critical
-    section; ``is_instrumented(fn)`` is the way for callers to check
-    whether a particular function is currently routed.
+    ``is_instrumented(fn)`` is the way for callers to check whether a
+    particular function is currently routed.
     """
     with _LOCK:
         _instr_module._ensure_tool_registered()
         _instr_module._INSTALLED_PROGRAMS[program.id] = program
-        _rebuild_probe_index()
+        unresolved = _rebuild_probe_index()
 
-    # Log per-probe resolution failures for visibility. The rebuild has
-    # already done the actual resolution work and skipped unresolvable
-    # specifiers; this loop is purely diagnostic.
     for probe in program.probes:
         if probe.spec.target == "line":
             continue
-        if resolve_target(probe.spec.specifier) is None:
+        if probe.spec.specifier in unresolved:
             logger.warning(
                 "Probe %s: target %s not resolvable; skipping",
                 probe.id,
@@ -252,11 +231,12 @@ def uninstall_program(program_id: str) -> None:
 def update_program(program: Program) -> None:
     """Replace any existing install of ``program.id`` with ``program``.
 
-    Defined as uninstall + install so each step acquires ``_LOCK``
-    independently — the lock is non-reentrant and ``install_program``
-    re-acquires it on its own.
+    ``install_program`` already overwrites a same-id entry in
+    ``_INSTALLED_PROGRAMS`` and runs a single rebuild — so update is
+    just a forward. The previous "uninstall + install" implementation
+    ran the rebuild twice and transiently disabled monitoring on the
+    target code in between, which was wasted work and a visibility gap.
     """
-    uninstall_program(program.id)
     install_program(program)
 
 
