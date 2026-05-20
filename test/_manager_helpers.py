@@ -15,7 +15,6 @@ from hogtrace.vm import compile as ht_compile, package as ht_package
 
 import libdebugger.instrumentation as instr
 import libdebugger.manager as manager
-from libdebugger.instrumentation import InstrumentationDecorator
 from test.strategies import _SPECIFIER_POOL
 
 
@@ -74,16 +73,16 @@ TARGETS = [
 
 
 def _unwrap(fn: Callable[..., Any]) -> None:
-    """Tear down whatever ``__posthog_decorator`` the test set up."""
-    dec = getattr(fn, "__posthog_decorator", None)
-    if dec is not None:
-        try:
-            dec.cleanup()
-        finally:
-            try:
-                delattr(fn, "__posthog_decorator")
-            except AttributeError:
-                pass
+    """Drop the ``__posthog_decorator`` sentinel a test may have set up.
+
+    With ``sys.monitoring``-based dispatch this is just a ``delattr``;
+    the marker is a flag, not a bytecode mutation. Kept as a helper so
+    older test patterns that need explicit cleanup keep working.
+    """
+    try:
+        delattr(fn, "__posthog_decorator")
+    except AttributeError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -102,29 +101,19 @@ def _build_program(source: str, program_id: str = "test-prog"):
 
 
 def _drain_registry() -> None:
-    """Tear down everything in the registry plus any lingering wrappers.
+    """Tear down every installed program plus any leftover markers.
 
     Used as cross-round cleanup inside the stateful machine — Hypothesis
     runs many examples within a single pytest invocation and the
     ``reset_state`` fixture only fires between pytest test cases, not
-    between Hypothesis examples.
+    between Hypothesis examples. With synchronous marker cleanup the
+    second loop is just defensive belt-and-suspenders.
     """
     for pid in list(instr._INSTALLED_PROGRAMS):
-        # No broad except: uninstall_program is the function under test;
-        # swallowing exceptions here would hide real regressions.
         manager.uninstall_program(pid)
 
-    # Also tear down any wrapper still attached to a target function. The
-    # production code leaves these in place until next-call self-cleanup;
-    # we need them gone between rounds so a stale wrapper from round N
-    # doesn't pollute round N+1's invariant check.
     for _name, obj in list(vars(target_mod).items()):
         if hasattr(obj, "__posthog_decorator"):
-            dec = getattr(obj, "__posthog_decorator")
-            try:
-                dec.cleanup()
-            except Exception:
-                pass
             try:
                 delattr(obj, "__posthog_decorator")
             except AttributeError:
@@ -132,11 +121,6 @@ def _drain_registry() -> None:
         if isinstance(obj, type):
             for _mname, mobj in list(vars(obj).items()):
                 if hasattr(mobj, "__posthog_decorator"):
-                    dec = getattr(mobj, "__posthog_decorator")
-                    try:
-                        dec.cleanup()
-                    except Exception:
-                        pass
                     try:
                         delattr(mobj, "__posthog_decorator")
                     except AttributeError:
@@ -255,7 +239,6 @@ def _expected_fact_invocations(n: int) -> int:
 
 
 __all__ = [
-    "InstrumentationDecorator",
     "TARGETS",
     "_CALL_ARGS_BY_SPECIFIER",
     "_any_qualname_probed_in_index",

@@ -125,13 +125,11 @@ def test_uninstall_unknown_program_id_is_silent():
 
 
 def test_self_cleanup_after_uninstall(hogtrace_scope):
-    """Install -> uninstall -> call: wrapper self-cleans on next invocation.
+    """Install -> uninstall: marker comes off synchronously, ``__code__`` is unchanged.
 
-    After uninstall_program but before the next call, the wrapper still
-    sits on the function (cleanup is lazy). The call triggers the
-    self-uninstall path in InstrumentationDecorator.__call__'s finally,
-    after which both the marker attribute and the bytecode mutation are
-    gone.
+    With ``sys.monitoring``-based dispatch ``uninstall_program`` disables
+    events on the target's code object and clears the sentinel attribute
+    in the same critical section. ``__code__`` is never modified.
     """
     from libdebugger.manager import install_program, uninstall_program
 
@@ -143,35 +141,25 @@ def test_self_cleanup_after_uninstall(hogtrace_scope):
     )
     install_program(program)
 
-    # Wrapper exists, bytecode is mutated to the redirector.
     assert hasattr(target_mod.fn_a, "__posthog_decorator")
-    assert target_mod.fn_a.__code__ is not original_code
+    assert target_mod.fn_a.__code__ is original_code, (
+        "sys.monitoring path never mutates __code__"
+    )
 
     uninstall_program("prog-p4-1")
 
-    # Cleanup is lazy: no call yet, so wrapper still on the function.
-    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "self-cleanup must be lazy: wrapper survives uninstall until next call"
-    )
-
-    # First call after the registry emptied: self-uninstall fires.
-    target_mod.fn_a(1)
-
     assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "P4: wrapper must self-clean on the next call after registry empties"
+        "P4: marker must be cleared synchronously by uninstall_program"
     )
-    assert target_mod.fn_a.__code__ is original_code, (
-        "P4: __code__ must be restored to original after self-cleanup"
-    )
+    assert target_mod.fn_a.__code__ is original_code
 
 
 def test_self_cleanup_after_uninstall_via_update_with_different_target(hogtrace_scope):
-    """Multi-program shared-function cleanup is keyed on per-qualname probe count.
+    """Shared-function cleanup is keyed on per-qualname probe count.
 
-    Program A and Program B both target fn_a (different program ids).
-    Uninstall A: B still has a probe on fn_a, so the wrapper must NOT
-    self-clean. Uninstall B: now NO probes target fn_a, so the next call
-    self-cleans.
+    Two programs A and B both target fn_a. Uninstall A: B still references
+    fn_a, so the marker stays. Uninstall B: nothing references fn_a, so
+    the marker drops.
     """
     from libdebugger.manager import install_program, uninstall_program
 
@@ -190,34 +178,25 @@ def test_self_cleanup_after_uninstall_via_update_with_different_target(hogtrace_
 
     assert hasattr(target_mod.fn_a, "__posthog_decorator")
 
-    # Uninstall A only — B still has probes on fn_a.
     uninstall_program("prog-a-share")
-    target_mod.fn_a(0)
-
     assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "wrapper must persist while ANY program still targets the function"
+        "marker must persist while ANY program still targets the function"
     )
-    assert target_mod.fn_a.__code__ is not original_code
+    assert target_mod.fn_a.__code__ is original_code
 
-    # Now uninstall B — registry slot for fn_a is empty.
     uninstall_program("prog-b-share")
-    target_mod.fn_a(0)
-
     assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "wrapper must self-clean once no program targets the function"
+        "marker must drop once no program targets the function"
     )
     assert target_mod.fn_a.__code__ is original_code
 
 
 def test_self_cleanup_does_not_fire_during_update(hogtrace_scope):
-    """update_program(B) with B.id == A.id: probes never go to zero across
-    the swap, so the wrapper must not self-clean.
+    """update_program(B) with B.id == A.id leaves the marker in place.
 
-    The Phase 1 path defines update as uninstall + install, which means
-    there's a brief window where the registry slot for the target may be
-    empty. But the test never CALLS the function during that window, so
-    the lazy self-cleanup never fires. The wrapper must still be in
-    place after the update completes.
+    update is uninstall + install. The intermediate uninstall briefly
+    drops the marker, but the install puts it right back. After the
+    update the marker exists and a call doesn't dislodge it.
     """
     from libdebugger.manager import install_program, update_program
 
@@ -229,35 +208,22 @@ def test_self_cleanup_does_not_fire_during_update(hogtrace_scope):
     )
     install_program(prog_a)
 
-    # Replace A with B at the same id (same target qualname).
     prog_b = _build_program(
         "fn:test.target.fn_a:entry { capture(x=2); }",
         program_id="prog-upd",
     )
     update_program(prog_b)
 
-    # Probes still exist for fn_a (now belonging to B). Wrapper persists.
     assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "wrapper must persist across update — probes still exist on the target"
+        "marker must persist across update — probes still exist on the target"
     )
-    # And a call doesn't dislodge it, because the registry still has B's probes.
     target_mod.fn_a(0)
-    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "wrapper must persist across update + call — B still has probes"
-    )
-    assert target_mod.fn_a.__code__ is not original_code
-
-    # Note: update_program is uninstall + install, so decorator identity is
-    # not asserted across the swap — only that the wrapper attribute survives.
+    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert target_mod.fn_a.__code__ is original_code
 
 
 def test_self_cleanup_preserves_other_wrappers(hogtrace_scope):
-    """Cleanup is per-function. Uninstall affecting fn_b doesn't disturb fn_a.
-
-    Install program A on fn_a AND program B on fn_b. Uninstall B. Call
-    both functions: fn_a's wrapper stays (probes still there); fn_b's
-    wrapper cleans up.
-    """
+    """Cleanup is per-function. Uninstall affecting fn_b doesn't disturb fn_a."""
     from libdebugger.manager import install_program, uninstall_program
 
     original_a = target_mod.fn_a.__code__
@@ -279,21 +245,12 @@ def test_self_cleanup_preserves_other_wrappers(hogtrace_scope):
 
     uninstall_program("prog-pres-b")
 
-    # Both still wrapped at this point (no calls yet).
-    assert hasattr(target_mod.fn_a, "__posthog_decorator")
-    assert hasattr(target_mod.fn_b, "__posthog_decorator")
-
-    # Call both. fn_a's probe persists -> stays wrapped. fn_b is orphaned
-    # -> cleans up.
-    target_mod.fn_a(0)
-    target_mod.fn_b(0, 0)
-
     assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "fn_a's wrapper must persist — its probe is still registered"
+        "fn_a's marker must persist — its probe is still registered"
     )
-    assert target_mod.fn_a.__code__ is not original_a
+    assert target_mod.fn_a.__code__ is original_a
     assert not hasattr(target_mod.fn_b, "__posthog_decorator"), (
-        "fn_b's wrapper must self-clean — its probe was uninstalled"
+        "fn_b's marker must drop — its probe was uninstalled"
     )
     assert target_mod.fn_b.__code__ is original_b
 
