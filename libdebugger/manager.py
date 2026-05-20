@@ -7,7 +7,11 @@ The dispatch state lives in ``libdebugger.instrumentation``:
 
 * ``_INSTALLED_PROGRAMS`` — source of truth, mutated under ``_LOCK``.
 * ``_PROBE_INDEX`` — derived (qualname, kind) -> probes, atomic-rebound.
-* ``_CODE_TO_QUALNAME`` — derived code-object routing table, atomic-rebound.
+  Kept for tests / tooling that look up by specifier.
+* ``_CODE_PROBE_INDEX`` — derived (code, kind) -> probes; aggregates every
+  specifier that resolves to the same code. The dispatch reads this.
+* ``_FUNCTIONS_BY_CODE`` — per-code function reference used to set / clear
+  the ``__posthog_decorator`` sentinel without re-walking the resolver.
 * ``_MONITORED_CODES`` — what ``sys.monitoring`` has enabled, mutated under
   ``_LOCK`` via ``_apply_monitoring`` from inside the rebuild.
 
@@ -119,15 +123,25 @@ def _resolve_code_for_specifier(specifier: str) -> Optional[CodeType]:
 def _rebuild_probe_index() -> None:
     """Rebuild the derived dispatch state from ``_INSTALLED_PROGRAMS``.
 
-    Called under ``_LOCK``. Computes a fresh ``_PROBE_INDEX`` plus
-    ``_CODE_TO_QUALNAME``, then asks ``_apply_monitoring`` to diff against
-    the currently-enabled set of code objects. Tuple reuse on unchanged
-    slots preserves the identity of probe tuples across reconciles where
-    the underlying programs didn't change.
+    Called under ``_LOCK``. Produces three derived structures from a single
+    pass over the installed programs:
 
-    Unresolvable specifiers still appear in ``_PROBE_INDEX`` (so the
-    registry-consistency invariants keep holding) but contribute nothing
-    to ``_CODE_TO_QUALNAME`` and aren't monitored — they simply never fire.
+      * ``_PROBE_INDEX`` keyed by ``(qualname, kind)`` for tests / tooling.
+      * ``_CODE_PROBE_INDEX`` keyed by ``(code, kind)`` for dispatch —
+        aggregates every specifier that resolves to the same code object so
+        an aliased function fires every probe pointing at it.
+      * ``_FUNCTIONS_BY_CODE`` ``code -> function`` for synchronous marker
+        attach / clear without re-walking the resolver later.
+
+    Line probes appear in ``_PROBE_INDEX`` (so registry-consistency
+    invariants keep holding) but are filtered out of the dispatch table
+    and monitoring mask — they would over-capture today, see Future-work
+    in the design doc. A warning is logged once per probe id.
+
+    Marker attach AND clear happen inside this critical section. Doing
+    it here keeps marker state in lockstep with ``_CODE_PROBE_INDEX``;
+    the previous design did marker attach outside the lock and could
+    strand a sentinel when an uninstall raced in between.
     """
     prev = _instr_module._PROBE_INDEX
 
@@ -150,44 +164,78 @@ def _rebuild_probe_index() -> None:
         else:
             new_index[key] = new_tuple
 
-    new_code_routing: Dict[CodeType, str] = {}
-    qualname_to_code: Dict[str, CodeType] = {}
+    qualname_to_resolved: Dict[str, Optional[Any]] = {}
+    new_code_index: Dict[Tuple[CodeType, str], list] = {}
     new_codes_to_kinds: Dict[CodeType, Set[str]] = {}
-    for qualname, target in new_index:
-        code = qualname_to_code.get(qualname)
-        if code is None and qualname not in qualname_to_code:
-            code = _resolve_code_for_specifier(qualname)
-            qualname_to_code[qualname] = code  # cache None for fast re-skip
-            if code is not None:
-                new_code_routing[code] = qualname
+    new_functions_by_code: Dict[CodeType, Any] = {}
+
+    for (qualname, target), pairs in new_index.items():
+        if target == "line":
+            _maybe_warn_line_probes(pairs)
+            continue
+        fn = qualname_to_resolved.get(qualname)
+        if fn is None and qualname not in qualname_to_resolved:
+            fn = resolve_target(qualname)
+            qualname_to_resolved[qualname] = fn
+        if fn is None:
+            continue
+        underlying = fn.__func__ if inspect.ismethod(fn) else fn
+        code = getattr(underlying, "__code__", None)
         if code is None:
             continue
+        new_functions_by_code[code] = underlying
+        new_code_index.setdefault((code, target), []).extend(pairs)
         new_codes_to_kinds.setdefault(code, set()).add(target)
 
-    prev_routing = _instr_module._CODE_TO_QUALNAME
-    departed_qualnames = {
-        prev_routing[code] for code in prev_routing if code not in new_code_routing
+    final_code_index: Dict[Tuple[CodeType, str], Tuple[Tuple[Program, Probe], ...]] = {
+        k: tuple(v) for k, v in new_code_index.items()
     }
 
-    _instr_module._PROBE_INDEX = new_index
-    _instr_module._CODE_TO_QUALNAME = new_code_routing
+    prev_functions = _instr_module._FUNCTIONS_BY_CODE
+    prev_codes = set(prev_functions)
+    new_codes = set(new_functions_by_code)
 
-    for qualname in departed_qualnames:
-        _clear_marker(qualname)
+    for code in prev_codes - new_codes:
+        fn = prev_functions[code]
+        try:
+            delattr(fn, "__posthog_decorator")
+        except AttributeError:
+            pass
+
+    for code, fn in new_functions_by_code.items():
+        if not hasattr(fn, "__posthog_decorator"):
+            try:
+                fn.__posthog_decorator = _ProbeMarker(code)
+            except Exception:
+                logger.exception(
+                    "failed to attach marker on %r", getattr(fn, "__qualname__", fn)
+                )
+
+    _instr_module._PROBE_INDEX = new_index
+    _instr_module._CODE_PROBE_INDEX = final_code_index
+    _instr_module._FUNCTIONS_BY_CODE = new_functions_by_code
 
     _instr_module._apply_monitoring(new_codes_to_kinds)
 
 
-def _clear_marker(qualname: str) -> None:
-    """Drop the ``__posthog_decorator`` sentinel from a no-longer-routed target."""
-    fn = resolve_target(qualname)
-    if fn is None:
-        return
-    underlying = fn.__func__ if inspect.ismethod(fn) else fn
-    try:
-        delattr(underlying, "__posthog_decorator")
-    except AttributeError:
-        pass
+_LINE_PROBE_WARNED: Set[Tuple[str, str]] = set()
+
+
+def _maybe_warn_line_probes(
+    pairs: Tuple[Tuple[Program, Probe], ...],
+) -> None:
+    """Log a one-shot warning per (program_id, probe_id) for a line probe."""
+    for program, probe in pairs:
+        key = (program.id, probe.id)
+        if key in _LINE_PROBE_WARNED:
+            continue
+        _LINE_PROBE_WARNED.add(key)
+        logger.warning(
+            "line probe %s on program %s is not supported in this version; "
+            "skipping (entry/exit probes still install normally)",
+            probe.id,
+            program.id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,41 +246,37 @@ def _clear_marker(qualname: str) -> None:
 def install_program(program: Program) -> None:
     """Register ``program`` and route its probes through the dispatch index.
 
-    Side effects:
-      1. ``_INSTALLED_PROGRAMS[program.id] = program`` (under ``_LOCK``).
-      2. ``_rebuild_probe_index()`` rebuilds the dispatch tables and applies
-         the ``sys.monitoring`` event diff (also under ``_LOCK``).
-      3. Tags every resolvable target with the ``__posthog_decorator``
-         sentinel — pytest-stress and a handful of property tests use the
-         attribute to detect "this function is currently routed".
+    Side effects (all under ``_LOCK``):
+      1. ``_ensure_tool_registered`` runs FIRST. If acquisition fails (every
+         candidate ``sys.monitoring`` slot is already owned by another tool),
+         the registry stays untouched — otherwise a future reconcile sees
+         the program as ``current`` and never retries.
+      2. ``_INSTALLED_PROGRAMS[program.id] = program``.
+      3. ``_rebuild_probe_index`` rebuilds the qualname / code dispatch
+         tables, attaches markers, and applies the ``sys.monitoring`` diff.
 
-    The first successful install lazily registers the ``sys.monitoring``
-    tool id.
+    Per-probe target resolution and marker attachment are part of the
+    rebuild so they happen inside the same critical section as the index
+    update — no race window for a concurrent uninstall to leave a stale
+    sentinel behind.
     """
     with _LOCK:
-        _instr_module._INSTALLED_PROGRAMS[program.id] = program
         _instr_module._ensure_tool_registered()
+        _instr_module._INSTALLED_PROGRAMS[program.id] = program
         _rebuild_probe_index()
 
+    # Log per-probe resolution failures for visibility. The rebuild has
+    # already done the actual resolution work and skipped unresolvable
+    # specifiers; this loop is purely diagnostic.
     for probe in program.probes:
-        fn = resolve_target(probe.spec.specifier)
-        if fn is None:
+        if probe.spec.target == "line":
+            continue
+        if resolve_target(probe.spec.specifier) is None:
             logger.warning(
                 "Probe %s: target %s not resolvable; skipping",
                 probe.id,
                 probe.spec.specifier,
             )
-            continue
-        underlying = fn.__func__ if inspect.ismethod(fn) else fn
-        if not hasattr(underlying, "__posthog_decorator"):
-            try:
-                underlying.__posthog_decorator = _ProbeMarker(underlying.__code__)
-            except Exception:
-                logger.exception(
-                    "Failed to attach marker for %s on probe %s",
-                    probe.spec.specifier,
-                    probe.id,
-                )
 
 
 def uninstall_program(program_id: str) -> None:
@@ -320,13 +364,13 @@ class HogTraceManager:
             )
 
     def stop(self):
-        """Halt the poller, uninstall every program, release the tool id.
+        """Halt the poller, uninstall every program, disable events.
 
         Snapshot ids under ``_LOCK``, release the lock, then iterate
         ``uninstall_program`` — ``_LOCK`` is non-reentrant and each
-        uninstall re-acquires it on its own. ``_release_tool`` runs last
-        so a subsequent ``start()`` in the same process gets a clean
-        ``sys.monitoring`` registration.
+        uninstall re-acquires it on its own. ``_release_tool`` runs last;
+        it disables monitoring events but DOES NOT free the slot, so a
+        subsequent ``start()`` reuses the same slot without callback churn.
         """
         if self.poller:
             self.poller.stop()

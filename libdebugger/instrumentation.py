@@ -14,15 +14,19 @@ State model
 
 * ``_PROBE_INDEX`` (``(qualname, kind)`` -> tuple of ``(Program, Probe)``) is
   derived from ``_INSTALLED_PROGRAMS`` by ``_rebuild_probe_index`` in the
-  manager. Atomic-rebound; hot-path reads are lock-free. Keyed by ``qualname``
-  so tests and tooling that index by specifier keep working — the runtime
-  dispatch uses ``_CODE_TO_QUALNAME`` to translate from the live code object
-  the interpreter hands us.
+  manager. Atomic-rebound; kept for tests / tooling that key by specifier.
+  Two specifiers can resolve to the same code object (aliases, inherited
+  methods); this index keeps them separate.
 
-* ``_CODE_TO_QUALNAME`` (``CodeType`` -> qualname) is the dispatch routing
-  table. Atomic-rebound alongside ``_PROBE_INDEX``. Only includes specifiers
-  whose targets resolved to a callable; unresolvable probes still appear in
-  ``_PROBE_INDEX`` (so registry-consistency invariants hold) but never fire.
+* ``_CODE_PROBE_INDEX`` (``(CodeType, kind)`` -> tuple of ``(Program, Probe)``)
+  is the actual dispatch table. Atomic-rebound alongside ``_PROBE_INDEX``.
+  Aggregates probes from every specifier that resolves to a given code
+  object so an aliased function fires all of its probes. The callbacks
+  read this directly from the live code object the interpreter hands us.
+
+* ``_FUNCTIONS_BY_CODE`` (``CodeType`` -> function) lets the rebuild path
+  reattach / clear the ``__posthog_decorator`` sentinel without re-walking
+  the dotted-name resolver. Mutated under ``_LOCK``.
 
 * ``_MONITORED_CODES`` (``CodeType`` -> active event mask) tracks what we've
   enabled on each code object so a reconcile can compute the disable diff.
@@ -64,7 +68,9 @@ _INSTALLED_PROGRAMS: Dict[str, Program] = {}
 
 _PROBE_INDEX: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
 
-_CODE_TO_QUALNAME: Dict[CodeType, str] = {}
+_CODE_PROBE_INDEX: Dict[Tuple[CodeType, str], Tuple[Tuple[Program, Probe], ...]] = {}
+
+_FUNCTIONS_BY_CODE: Dict[CodeType, Any] = {}
 
 _MONITORED_CODES: Dict[CodeType, int] = {}
 
@@ -72,14 +78,20 @@ _EVENT_SINK: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
 
 # ---------------------------------------------------------------------------
-# Tool-id lifecycle. We claim ``sys.monitoring.DEBUGGER_ID`` (0) lazily on the
-# first successful install and free it from ``HogTraceManager.stop()`` for
-# clean teardown.
+# Tool-id lifecycle. PEP 669 reserves ids 0 (DEBUGGER_ID), 1 (COVERAGE_ID),
+# 2 (PROFILER_ID), 5 (OPTIMIZER_ID); slots 3 and 4 are for ad-hoc tools.
+# We prefer slot 3 to stay out of the way of pdb / debugpy / coverage,
+# fall back to 4, and only as a last resort take DEBUGGER_ID. Once acquired
+# the slot is held for the process lifetime — ``_release_tool`` disables
+# events but keeps ownership so a start/stop cycle doesn't churn callback
+# registration or open a window where another tool can grab our slot.
 # ---------------------------------------------------------------------------
 
-_TOOL_ID: Final[int] = sys.monitoring.DEBUGGER_ID
 _TOOL_NAME: Final[str] = "libdebugger"
+_TOOL_CANDIDATES: Final[Tuple[int, ...]] = (3, 4, sys.monitoring.DEBUGGER_ID)
+_TOOL_ID: int = -1  # populated by _ensure_tool_registered
 _TOOL_REGISTERED: bool = False
+_CALLBACKS_REGISTERED: bool = False
 
 _EVENTS = sys.monitoring.events
 
@@ -88,7 +100,6 @@ _EVENTS = sys.monitoring.events
 # and filter by code object inside the callback.
 _ENTRY_EVENT_MASK: Final[int] = _EVENTS.PY_START | _EVENTS.PY_RESUME
 _EXIT_EVENT_MASK: Final[int] = _EVENTS.PY_RETURN | _EVENTS.PY_YIELD
-_LINE_EVENT_MASK: Final[int] = _EVENTS.LINE
 _GLOBAL_EVENT_MASK: Final[int] = _EVENTS.PY_UNWIND
 
 
@@ -207,10 +218,7 @@ def resolve_code_for_callable(fn: Any) -> Optional[CodeType]:
 
 
 def _dispatch_entry(code: CodeType) -> None:
-    qualname = _CODE_TO_QUALNAME.get(code)
-    if qualname is None:
-        return
-    probes = _PROBE_INDEX.get((qualname, "entry"), ())
+    probes = _CODE_PROBE_INDEX.get((code, "entry"), ())
     if not probes:
         return
     try:
@@ -226,10 +234,7 @@ def _dispatch_exit(
     retval: Any = None,
     exception: Optional[BaseException] = None,
 ) -> None:
-    qualname = _CODE_TO_QUALNAME.get(code)
-    if qualname is None:
-        return
-    probes = _PROBE_INDEX.get((qualname, "exit"), ())
+    probes = _CODE_PROBE_INDEX.get((code, "exit"), ())
     if not probes:
         return
     try:
@@ -262,20 +267,11 @@ def _on_py_unwind(
 
 
 def _on_line(code: CodeType, line_number: int) -> Any:
-    # Scaffolded only — v1 line-probe semantics remain TBD. Fire the slot so
-    # the registry-consistency invariants exercise the path; capture context
-    # for a line probe is out of scope until v2.
-    qualname = _CODE_TO_QUALNAME.get(code)
-    if qualname is None:
-        return
-    probes = _PROBE_INDEX.get((qualname, "line"), ())
-    if not probes:
-        return
-    try:
-        frame = sys._getframe(1)
-    except ValueError:
-        return
-    _run_probes(probes, frame)
+    # Line probes are not implemented in v1 — the install path skips them
+    # with a warning and the LINE event mask never gets enabled. This
+    # callback exists only because ``register_callback`` requires one if
+    # the event is ever toggled; nothing should reach it.
+    return
 
 
 # ---------------------------------------------------------------------------
@@ -284,47 +280,69 @@ def _on_line(code: CodeType, line_number: int) -> Any:
 
 
 def _ensure_tool_registered() -> None:
-    """Acquire the monitoring tool id and register every callback. Idempotent.
+    """Acquire a ``sys.monitoring`` slot and register every callback.
 
-    Must be called under ``_LOCK`` so two threads don't both call
-    ``use_tool_id``. Raises ``RuntimeError`` if another tool (e.g. pdb,
-    PyCharm) already owns the slot — surfacing the conflict is safer than
-    silently fighting another debugger.
+    Must be called under ``_LOCK``. Idempotent across repeated calls and
+    across stop()/start() cycles — the slot is held for the lifetime of
+    the process, so subsequent calls just flip events back on.
+
+    Slot preference order: 3, then 4, then ``DEBUGGER_ID`` (0). Raises
+    ``RuntimeError`` only when every candidate slot is owned by some
+    other tool — at that point we'd be fighting pdb / debugpy / coverage
+    over the same slot and would rather fail loudly than collide.
     """
-    global _TOOL_REGISTERED
+    global _TOOL_ID, _TOOL_REGISTERED, _CALLBACKS_REGISTERED
     if _TOOL_REGISTERED:
         return
 
-    owner = sys.monitoring.get_tool(_TOOL_ID)
-    if owner is None:
-        sys.monitoring.use_tool_id(_TOOL_ID, _TOOL_NAME)
-    elif owner != _TOOL_NAME:
-        raise RuntimeError(
-            f"sys.monitoring tool id {_TOOL_ID} is already owned by "
-            f"{owner!r}; refusing to install libdebugger probes"
-        )
+    if _TOOL_ID == -1:
+        chosen: Optional[int] = None
+        for candidate in _TOOL_CANDIDATES:
+            owner = sys.monitoring.get_tool(candidate)
+            if owner is None:
+                sys.monitoring.use_tool_id(candidate, _TOOL_NAME)
+                chosen = candidate
+                break
+            if owner == _TOOL_NAME:
+                chosen = candidate
+                break
+        if chosen is None:
+            owners = [
+                (cand, sys.monitoring.get_tool(cand)) for cand in _TOOL_CANDIDATES
+            ]
+            raise RuntimeError(
+                "every candidate sys.monitoring tool slot is taken; "
+                f"refusing to install libdebugger probes (owners={owners})"
+            )
+        _TOOL_ID = chosen
 
-    sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_START, _on_py_start)
-    sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_RESUME, _on_py_resume)
-    sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_RETURN, _on_py_return)
-    sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_YIELD, _on_py_yield)
-    sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_UNWIND, _on_py_unwind)
-    sys.monitoring.register_callback(_TOOL_ID, _EVENTS.LINE, _on_line)
+    if not _CALLBACKS_REGISTERED:
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_START, _on_py_start)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_RESUME, _on_py_resume)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_RETURN, _on_py_return)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_YIELD, _on_py_yield)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_UNWIND, _on_py_unwind)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.LINE, _on_line)
+        _CALLBACKS_REGISTERED = True
 
-    # PY_UNWIND is global-only — enable it for our tool id. The callback
-    # filters by code via ``_CODE_TO_QUALNAME``, so the global enablement
-    # is effectively no-op for codes we don't care about.
+    # PY_UNWIND is global-only — enable it for our tool id. The dispatch
+    # callback short-circuits on codes that aren't in ``_CODE_PROBE_INDEX``,
+    # so a permanently-global PY_UNWIND is effectively no-op when nothing
+    # is monitored.
     sys.monitoring.set_events(_TOOL_ID, _GLOBAL_EVENT_MASK)
 
     _TOOL_REGISTERED = True
 
 
 def _release_tool() -> None:
-    """Disable every active event and release the tool id. Idempotent.
+    """Disable every active event but retain ownership of the tool slot.
 
-    Called from ``HogTraceManager.stop()`` so a process can re-``start()``
-    cleanly. Also unwires every callback so a future start re-registers
-    against a fresh slot.
+    Holding the slot for process lifetime avoids two problems: callback
+    re-registration churn across start/stop cycles, and a window where
+    another tool (pdb, coverage) can grab our slot between stop() and
+    the next install_program(). Callers that genuinely want to free the
+    slot — typically only the test harness — must call
+    ``sys.monitoring.free_tool_id(_TOOL_ID)`` themselves.
     """
     global _TOOL_REGISTERED
     if not _TOOL_REGISTERED:
@@ -342,24 +360,6 @@ def _release_tool() -> None:
     except Exception:
         logger.exception("failed disabling global events")
 
-    for event in (
-        _EVENTS.PY_START,
-        _EVENTS.PY_RESUME,
-        _EVENTS.PY_RETURN,
-        _EVENTS.PY_YIELD,
-        _EVENTS.PY_UNWIND,
-        _EVENTS.LINE,
-    ):
-        try:
-            sys.monitoring.register_callback(_TOOL_ID, event, None)
-        except Exception:
-            logger.exception("failed unregistering callback for event %r", event)
-
-    try:
-        sys.monitoring.free_tool_id(_TOOL_ID)
-    except Exception:
-        logger.exception("failed freeing tool id %d", _TOOL_ID)
-
     _TOOL_REGISTERED = False
 
 
@@ -368,7 +368,10 @@ def _apply_monitoring(new_codes_to_kinds: Dict[CodeType, Set[str]]) -> None:
 
     For each code that left the set: disable all events. For each code in
     the new set: compute the event mask from the kinds present in the
-    probe index and call ``set_local_events`` to enable them.
+    probe index and call ``set_local_events`` to enable them. Line probes
+    are intentionally NOT supported by this path — the manager skips them
+    in the rebuild, so ``new_codes_to_kinds`` only carries ``entry`` /
+    ``exit`` kinds.
 
     Called under ``_LOCK`` from ``_rebuild_probe_index``.
     """
@@ -388,8 +391,6 @@ def _apply_monitoring(new_codes_to_kinds: Dict[CodeType, Set[str]]) -> None:
             mask |= _ENTRY_EVENT_MASK
         if "exit" in kinds:
             mask |= _EXIT_EVENT_MASK
-        if "line" in kinds:
-            mask |= _LINE_EVENT_MASK
         if mask == 0:
             continue
         if _MONITORED_CODES.get(code) == mask:

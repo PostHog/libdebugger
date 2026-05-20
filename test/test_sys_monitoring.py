@@ -51,31 +51,51 @@ def test_tool_registration_is_idempotent():
 
 
 def test_release_tool_disables_all_events():
-    """After release, ``_MONITORED_CODES`` is empty and the tool slot is free."""
+    """After release, ``_MONITORED_CODES`` is empty but the tool slot is retained.
+
+    Production holds the slot for process lifetime — see ``_release_tool``.
+    The conftest separately frees it between tests; from the production
+    contract's point of view, ``_release_tool`` only flips events off.
+    """
     program = _build_program(
         "fn:test.target.fn_a:entry { }",
         program_id="release-1",
     )
     install_program(program)
     assert instr._MONITORED_CODES, "install should have enabled at least one code"
+    code = target_mod.fn_a.__code__
 
     with instr._LOCK:
         instr._release_tool()
 
     assert not instr._TOOL_REGISTERED
     assert instr._MONITORED_CODES == {}
-    assert sys.monitoring.get_tool(instr._TOOL_ID) is None
+    # Slot is retained for process lifetime.
+    assert sys.monitoring.get_tool(instr._TOOL_ID) == instr._TOOL_NAME
+    # And events for the previously-monitored code are off.
+    assert sys.monitoring.get_local_events(instr._TOOL_ID, code) == 0
 
 
 def test_tool_conflict_refuses_to_install():
-    """``_ensure_tool_registered`` raises if another tool owns ``DEBUGGER_ID``."""
-    sys.monitoring.use_tool_id(instr._TOOL_ID, "intruder")
+    """``_ensure_tool_registered`` raises if every candidate slot is taken."""
+    instr._TOOL_ID = -1
+    instr._TOOL_REGISTERED = False
+    for slot in instr._TOOL_CANDIDATES:
+        try:
+            sys.monitoring.free_tool_id(slot)
+        except Exception:
+            pass
+        sys.monitoring.use_tool_id(slot, f"intruder-{slot}")
     try:
         with instr._LOCK:
-            with pytest.raises(RuntimeError, match="intruder"):
+            with pytest.raises(RuntimeError, match="taken"):
                 instr._ensure_tool_registered()
     finally:
-        sys.monitoring.free_tool_id(instr._TOOL_ID)
+        for slot in instr._TOOL_CANDIDATES:
+            try:
+                sys.monitoring.free_tool_id(slot)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

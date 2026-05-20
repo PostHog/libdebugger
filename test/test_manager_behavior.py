@@ -132,7 +132,8 @@ def test_module_globals_present():
     assert hasattr(instr, "_PROBE_INDEX")
     assert hasattr(instr, "_INSTALLED_PROGRAMS")
     assert hasattr(instr, "_LOCK")
-    assert hasattr(instr, "_CODE_TO_QUALNAME")
+    assert hasattr(instr, "_CODE_PROBE_INDEX")
+    assert hasattr(instr, "_FUNCTIONS_BY_CODE")
     assert hasattr(instr, "_MONITORED_CODES")
     assert instr._PROBE_INDEX == {}
     assert instr._INSTALLED_PROGRAMS == {}
