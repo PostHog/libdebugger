@@ -296,10 +296,12 @@ def _ensure_tool_registered() -> None:
     across stop()/start() cycles — the slot is held for the lifetime of
     the process, so subsequent calls just flip events back on.
 
-    Slot preference order: 3, then 4, then ``DEBUGGER_ID`` (0). Raises
-    ``RuntimeError`` only when every candidate slot is owned by some
-    other tool — at that point we'd be fighting pdb / debugpy / coverage
-    over the same slot and would rather fail loudly than collide.
+    Slot preference order: the ad-hoc slots (3, 4) first, then the
+    reserved slots (``DEBUGGER_ID``, ``COVERAGE_ID``, ``PROFILER_ID``,
+    ``OPTIMIZER_ID``) — see ``_TOOL_CANDIDATES`` for the canonical list.
+    Raises ``RuntimeError`` only when every candidate slot is owned by
+    some other tool; at that point we'd be fighting pdb / debugpy /
+    coverage / profiler over a slot and would rather fail loudly.
     """
     global _TOOL_ID, _TOOL_REGISTERED, _CALLBACKS_REGISTERED
     if _TOOL_REGISTERED:
