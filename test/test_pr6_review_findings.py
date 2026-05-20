@@ -33,8 +33,9 @@ def test_failed_install_does_not_pollute_registry():
     id/hash) and skips installing it. Probes stay dead forever.
     """
     # Take every candidate slot so _ensure_tool_registered cannot succeed.
+    instr._TOOL_ID = -1
     instr._TOOL_REGISTERED = False
-    for slot in (3, 4, sys.monitoring.DEBUGGER_ID):
+    for slot in instr._TOOL_CANDIDATES:
         try:
             sys.monitoring.free_tool_id(slot)
         except Exception:
@@ -55,7 +56,7 @@ def test_failed_install_does_not_pollute_registry():
         )
         assert instr._PROBE_INDEX == {}
     finally:
-        for slot in (3, 4, sys.monitoring.DEBUGGER_ID):
+        for slot in instr._TOOL_CANDIDATES:
             try:
                 sys.monitoring.free_tool_id(slot)
             except Exception:
@@ -196,6 +197,53 @@ def test_tool_id_falls_back_when_preferred_slot_taken():
             sys.monitoring.free_tool_id(3)
         except Exception:
             pass
+
+
+def test_tool_id_falls_back_to_reserved_slots_when_custom_taken():
+    """When 3, 4, and DEBUGGER_ID are all taken, fall back to the other
+    reserved slots (COVERAGE_ID, PROFILER_ID, OPTIMIZER_ID) rather than
+    refusing to install.
+
+    The previous fallback list — (3, 4, DEBUGGER_ID) — gave up too early
+    if a pdb instance happened to be holding slot 0 alongside whatever
+    else was running. PEP 669 reserves slots 0/1/2/5 for specific tool
+    archetypes, but ``use_tool_id`` is willing to lend them to us if the
+    archetype isn't currently using one — and an instrumentation tool is
+    materially less invasive than a debugger / profiler / coverage tool,
+    so falling back is safer than failing.
+    """
+    instr._TOOL_ID = -1
+    instr._TOOL_REGISTERED = False
+    occupied = (3, 4, sys.monitoring.DEBUGGER_ID)
+    for slot in occupied:
+        try:
+            sys.monitoring.free_tool_id(slot)
+        except Exception:
+            pass
+        sys.monitoring.use_tool_id(slot, f"intruder-{slot}")
+    try:
+        program = _build_program(
+            "fn:test.target.fn_a:entry { }",
+            program_id="reserved-fallback",
+        )
+        install_program(program)
+        assert instr._TOOL_ID not in occupied, (
+            f"acquired slot {instr._TOOL_ID} must not be one of the occupied "
+            f"slots {occupied}"
+        )
+        # The acquired slot must be one of the reserved-tool ids:
+        # COVERAGE_ID, PROFILER_ID, OPTIMIZER_ID.
+        assert instr._TOOL_ID in (
+            sys.monitoring.COVERAGE_ID,
+            sys.monitoring.PROFILER_ID,
+            sys.monitoring.OPTIMIZER_ID,
+        ), f"unexpected slot {instr._TOOL_ID}"
+    finally:
+        for slot in occupied:
+            try:
+                sys.monitoring.free_tool_id(slot)
+            except Exception:
+                pass
 
 
 def test_tool_slot_retained_across_release():

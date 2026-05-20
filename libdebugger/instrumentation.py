@@ -80,15 +80,25 @@ _EVENT_SINK: Optional[Callable[[str, Dict[str, Any]], None]] = None
 # ---------------------------------------------------------------------------
 # Tool-id lifecycle. PEP 669 reserves ids 0 (DEBUGGER_ID), 1 (COVERAGE_ID),
 # 2 (PROFILER_ID), 5 (OPTIMIZER_ID); slots 3 and 4 are for ad-hoc tools.
-# We prefer slot 3 to stay out of the way of pdb / debugpy / coverage,
-# fall back to 4, and only as a last resort take DEBUGGER_ID. Once acquired
-# the slot is held for the process lifetime — ``_release_tool`` disables
-# events but keeps ownership so a start/stop cycle doesn't churn callback
-# registration or open a window where another tool can grab our slot.
+# We prefer the ad-hoc slots first so we stay out of the way of pdb /
+# debugpy / coverage by default, then fall through every reserved slot
+# before giving up — refusing to install when even one slot might still
+# be free would be worse than borrowing a reserved slot that isn't in
+# use. Once acquired the slot is held for the lifetime of the process —
+# ``_release_tool`` disables events but keeps ownership so a start/stop
+# cycle doesn't churn callback registration or open a window where
+# another tool can grab our slot.
 # ---------------------------------------------------------------------------
 
 _TOOL_NAME: Final[str] = "libdebugger"
-_TOOL_CANDIDATES: Final[Tuple[int, ...]] = (3, 4, sys.monitoring.DEBUGGER_ID)
+_TOOL_CANDIDATES: Final[Tuple[int, ...]] = (
+    3,
+    4,
+    sys.monitoring.DEBUGGER_ID,
+    sys.monitoring.COVERAGE_ID,
+    sys.monitoring.PROFILER_ID,
+    sys.monitoring.OPTIMIZER_ID,
+)
 _TOOL_ID: int = -1  # populated by _ensure_tool_registered
 _TOOL_REGISTERED: bool = False
 _CALLBACKS_REGISTERED: bool = False
