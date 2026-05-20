@@ -154,12 +154,7 @@ def _resolve_target_or_none(specifier: str):
 
 
 def _any_qualname_probed_in_index(qualname: str) -> bool:
-    """True iff any entry/exit/line slot for ``qualname`` carries probes.
-
-    Mirrors instrumentation._any_probes_for but reads through the test's
-    own snapshot of _PROBE_INDEX so the assertion is independent of the
-    production helper under test.
-    """
+    """True iff any entry/exit/line slot for ``qualname`` carries probes."""
     index = instr._PROBE_INDEX
     return bool(
         index.get((qualname, "entry"))

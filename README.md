@@ -3,9 +3,9 @@
 > [!WARNING]
 > This is an **EXPERIMENTAL** library not ready for production use. For internal use only (for now).
 
-A Python library that enables live debugging in production through runtime bytecode instrumentation. 
-Set breakpoints remotely via PostHog and capture local variables, stack traces, and execution context 
-without stopping your application.
+A Python library that enables live debugging in production through PEP 669 `sys.monitoring` events.
+Set breakpoints remotely via PostHog and capture local variables, stack traces, and execution context
+without stopping your application. Requires Python 3.12+.
 
 ## Test
 
@@ -18,5 +18,5 @@ $ tox
 You can also run tests for a particular version with `uv` directly
 
 ```shell
-$ uv run --python 3.11 pytest test/
+$ uv run --python 3.12 pytest test/
 ```

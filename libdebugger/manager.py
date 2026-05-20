@@ -109,15 +109,6 @@ def _slot_ids(
     return frozenset((program.id, probe.id) for program, probe in slot)
 
 
-def _resolve_code_for_specifier(specifier: str) -> Optional[CodeType]:
-    fn = resolve_target(specifier)
-    if fn is None:
-        return None
-    if inspect.ismethod(fn):
-        fn = fn.__func__
-    return getattr(fn, "__code__", None)
-
-
 def _rebuild_probe_index() -> None:
     """Rebuild the derived dispatch state from ``_INSTALLED_PROGRAMS``.
 

@@ -121,15 +121,6 @@ def set_event_sink(
     _EVENT_SINK = sink
 
 
-def _any_probes_for(qualname: str) -> bool:
-    index = _PROBE_INDEX
-    return bool(
-        index.get((qualname, "entry"))
-        or index.get((qualname, "exit"))
-        or index.get((qualname, "line"))
-    )
-
-
 # ---------------------------------------------------------------------------
 # Public helper: detect whether a callable is currently routed.
 # ---------------------------------------------------------------------------

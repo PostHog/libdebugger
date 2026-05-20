@@ -270,3 +270,59 @@ def _walk_values(obj):
             yield from _walk_values(v)
     else:
         yield obj
+
+
+# ---------------------------------------------------------------------------
+# Reentrancy: invoking the instrumented target from within the dispatch
+# callback must not recursively fire a probe for that inner call.
+#
+# CPython's sys.monitoring suppresses events while a callback for that
+# tool id is already running — see CPython's _PyEval_SetMonitoring docs
+# and the implementation in Python/legacy_tracing.c. We pin that assumption
+# with a regression test so a future Python version that changes the
+# behavior (or our own switch to a different tool-id scheme) gets caught.
+# ---------------------------------------------------------------------------
+
+
+def test_callback_does_not_reenter_on_self_call(monkeypatch):
+    """If a probe body calls the instrumented function, the inner call's
+    PY_START event must NOT fire a second probe.
+
+    The interpreter is documented to suppress monitoring events for a
+    tool id while one of that tool's callbacks is already on the stack.
+    We rely on that property — without it, every entry probe on a
+    function that the sink ever touches would loop catastrophically.
+    """
+    program = _build_program(
+        "fn:test.target.fn_a:entry { capture(x=1); }",
+        program_id="reentry-1",
+    )
+
+    fires: list[int] = []
+
+    def reentrant_sink(event_name, properties):
+        # First fire: re-enter fn_a from inside the sink.
+        # If sys.monitoring did NOT suppress events for libdebugger's
+        # tool id while we're already inside a callback, this nested
+        # call would queue another PY_START and we'd recurse.
+        fires.append(len(fires))
+        if len(fires) == 1:
+            target_mod.fn_a(99)
+
+    instr.set_event_sink(reentrant_sink)
+
+    with new_context():
+        install_program(program)
+        try:
+            target_mod.fn_a(7)
+        finally:
+            uninstall_program("reentry-1")
+
+    # Exactly one capture fired: the outer call. The inner call (made
+    # from inside the sink) was suppressed by the interpreter.
+    assert len(fires) == 1, (
+        f"expected sys.monitoring to suppress nested events while a "
+        f"callback is active; got {len(fires)} fires — if this number "
+        f"grew, the interpreter behavior we rely on has changed and the "
+        f"dispatch path needs an explicit reentrancy guard"
+    )

@@ -2,7 +2,7 @@
 name = "libdebugger-flask-example"
 version = "0.0.1"
 description = "Tiny Flask app for iterating on libdebugger end-to-end."
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "flask>=3.0",
     "libdebugger",
