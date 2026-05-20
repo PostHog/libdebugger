@@ -3,7 +3,8 @@
 What you get when this starts:
 
 * The functions in ``services.py`` are valid probe targets — their
-  qualnames line up with ``example.services.<name>``.
+  qualnames line up with ``services.<name>`` (the app's import path
+  resolves the module as plain ``services``, not ``example.services``).
 * ``probes.py`` compiles a small set of probes and installs them at
   startup so probe firing is observable without a PostHog server.
 * Every request runs inside a hogtrace request scope so probes have a
