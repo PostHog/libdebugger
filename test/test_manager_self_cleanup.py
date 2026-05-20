@@ -115,13 +115,10 @@ def test_uninstall_unknown_program_id_is_silent():
 # Phase 4 — Self-cleanup convergence (P4)
 # ---------------------------------------------------------------------------
 #
-# Property: after uninstalling every program targeting function F and then
-# calling F once, hasattr(F, '__posthog_decorator') is False AND
-# F.__code__ is original_code_for_F.
-#
-# Production-side support already landed in Phase 1 (self-uninstall block in
-# InstrumentationDecorator.__call__'s finally, plus the name-mangling fix
-# for delattr). These tests just cover the property end-to-end.
+# Property: after uninstalling every program targeting function F,
+# ``is_instrumented(F)`` is False AND ``F.__code__`` is unchanged.
+# Cleanup is synchronous under sys.monitoring-based dispatch — no
+# next-call trigger needed.
 
 
 def test_self_cleanup_after_uninstall(hogtrace_scope):
@@ -141,14 +138,14 @@ def test_self_cleanup_after_uninstall(hogtrace_scope):
     )
     install_program(program)
 
-    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert instr.is_instrumented(target_mod.fn_a)
     assert target_mod.fn_a.__code__ is original_code, (
         "sys.monitoring path never mutates __code__"
     )
 
     uninstall_program("prog-p4-1")
 
-    assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
+    assert not instr.is_instrumented(target_mod.fn_a), (
         "P4: marker must be cleared synchronously by uninstall_program"
     )
     assert target_mod.fn_a.__code__ is original_code
@@ -176,16 +173,16 @@ def test_self_cleanup_after_uninstall_via_update_with_different_target(hogtrace_
     install_program(prog_a)
     install_program(prog_b)
 
-    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert instr.is_instrumented(target_mod.fn_a)
 
     uninstall_program("prog-a-share")
-    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+    assert instr.is_instrumented(target_mod.fn_a), (
         "marker must persist while ANY program still targets the function"
     )
     assert target_mod.fn_a.__code__ is original_code
 
     uninstall_program("prog-b-share")
-    assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
+    assert not instr.is_instrumented(target_mod.fn_a), (
         "marker must drop once no program targets the function"
     )
     assert target_mod.fn_a.__code__ is original_code
@@ -214,11 +211,11 @@ def test_self_cleanup_does_not_fire_during_update(hogtrace_scope):
     )
     update_program(prog_b)
 
-    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+    assert instr.is_instrumented(target_mod.fn_a), (
         "marker must persist across update — probes still exist on the target"
     )
     target_mod.fn_a(0)
-    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert instr.is_instrumented(target_mod.fn_a)
     assert target_mod.fn_a.__code__ is original_code
 
 
@@ -240,16 +237,16 @@ def test_self_cleanup_preserves_other_wrappers(hogtrace_scope):
     install_program(prog_a)
     install_program(prog_b)
 
-    assert hasattr(target_mod.fn_a, "__posthog_decorator")
-    assert hasattr(target_mod.fn_b, "__posthog_decorator")
+    assert instr.is_instrumented(target_mod.fn_a)
+    assert instr.is_instrumented(target_mod.fn_b)
 
     uninstall_program("prog-pres-b")
 
-    assert hasattr(target_mod.fn_a, "__posthog_decorator"), (
+    assert instr.is_instrumented(target_mod.fn_a), (
         "fn_a's marker must persist — its probe is still registered"
     )
     assert target_mod.fn_a.__code__ is original_a
-    assert not hasattr(target_mod.fn_b, "__posthog_decorator"), (
+    assert not instr.is_instrumented(target_mod.fn_b), (
         "fn_b's marker must drop — its probe was uninstalled"
     )
     assert target_mod.fn_b.__code__ is original_b

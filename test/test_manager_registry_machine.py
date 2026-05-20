@@ -95,57 +95,41 @@ class RegistryMachine(RuleBasedStateMachine):
 
     @rule(specifier=st.sampled_from(_SPECIFIER_POOL))
     def call_function(self, specifier):
-        """Call a target function once; assert wrapped IFF probed for it.
+        """Call a target function once; assert instrumented IFF probes exist for it.
 
-        This is the P4 convergence probe. After the call:
-          - If probes exist for ``specifier`` in _PROBE_INDEX, the wrapper
-            must still be in place (``__posthog_decorator`` present).
-          - If no probes exist for ``specifier``, the call must have
-            triggered self-uninstall (``__posthog_decorator`` absent AND
-            ``__code__`` restored to the original).
-
-        The assertion runs INSIDE the rule rather than as a global
-        ``@invariant`` because the "wrapper still in place but registry
-        empty" state is legal BETWEEN an uninstall rule and the next
-        call_function rule. Only after the call do we expect convergence.
+        This is the P4 convergence probe. With sys.monitoring-based
+        dispatch the cleanup happens synchronously inside
+        ``uninstall_program``, so the convergence holds after any
+        install/uninstall, with or without a call.
         """
         fn = _resolve_target_or_none(specifier)
         if fn is None:
-            # Specifier doesn't resolve (shouldn't happen for fixed pool,
-            # but guard anyway so the rule can't blow up the machine).
             return
 
-        # Snapshot original code if the function isn't currently wrapped,
-        # so we can check __code__ is the original after a self-uninstall.
-        # When wrapped, fn.__code__ is the redirector; the original code
-        # is stored on the decorator.
-        dec_before = getattr(fn, "__posthog_decorator", None)
-        original_code = (
-            dec_before.original_code if dec_before is not None else fn.__code__
-        )
+        original_code = fn.__func__.__code__ if hasattr(fn, "__func__") else fn.__code__
 
         args = _CALL_ARGS_BY_SPECIFIER[specifier]
         try:
             fn(*args)
         except Exception:
-            # Probe path is allowed to log+swallow; user-code exceptions
-            # from target functions (none of ours raise on these args, but
-            # belt-and-suspenders) propagate through the wrapper and we
-            # catch them here so the machine keeps marching.
+            # User-code exceptions from target functions propagate; we
+            # catch them so the machine keeps marching.
             pass
 
-        # P4 convergence: wrapper present IFF probes exist for this qualname.
-        has_attr = hasattr(fn, "__posthog_decorator")
+        # P4 convergence: code monitored IFF probes exist for this qualname.
+        has_monitoring = instr.is_instrumented(fn)
         has_probes = _any_qualname_probed_in_index(specifier)
-        assert has_attr == has_probes, (
+        assert has_monitoring == has_probes, (
             f"P4 convergence violated after calling {specifier}: "
-            f"hasattr(__posthog_decorator)={has_attr}, "
-            f"has_probes_in_index={has_probes}. Wrapper must exist IFF probes do."
+            f"is_instrumented={has_monitoring}, "
+            f"has_probes_in_index={has_probes}. Both must agree."
         )
 
-        # And on the false-side, __code__ must be back to the original.
-        if not has_attr:
-            assert fn.__code__ is original_code, (
+        # __code__ is never mutated under sys.monitoring.
+        if not has_monitoring:
+            assert (
+                fn.__func__.__code__ if hasattr(fn, "__func__") else fn.__code__
+            ) is original_code, (
                 f"P4 convergence: after self-cleanup for {specifier}, "
                 f"__code__ must be the original code object"
             )

@@ -10,10 +10,9 @@ The dispatch state lives in ``libdebugger.instrumentation``:
   Kept for tests / tooling that look up by specifier.
 * ``_CODE_PROBE_INDEX`` — derived (code, kind) -> probes; aggregates every
   specifier that resolves to the same code. The dispatch reads this.
-* ``_FUNCTIONS_BY_CODE`` — per-code function reference used to set / clear
-  the ``__posthog_decorator`` sentinel without re-walking the resolver.
 * ``_MONITORED_CODES`` — what ``sys.monitoring`` has enabled, mutated under
-  ``_LOCK`` via ``_apply_monitoring`` from inside the rebuild.
+  ``_LOCK`` via ``_apply_monitoring`` from inside the rebuild. Also the
+  source of truth for ``is_instrumented(fn)``.
 
 The bytecode-rewriting decorator that backed earlier versions is gone;
 ``libdebugger/bytecode.py`` is retained for reference but unused at runtime.
@@ -36,7 +35,6 @@ from types import CodeType
 from libdebugger import instrumentation as _instr_module
 from libdebugger.instrumentation import (
     _LOCK,
-    _ProbeMarker,
     set_event_sink,
 )
 
@@ -123,25 +121,18 @@ def _resolve_code_for_specifier(specifier: str) -> Optional[CodeType]:
 def _rebuild_probe_index() -> None:
     """Rebuild the derived dispatch state from ``_INSTALLED_PROGRAMS``.
 
-    Called under ``_LOCK``. Produces three derived structures from a single
+    Called under ``_LOCK``. Produces two derived structures from a single
     pass over the installed programs:
 
       * ``_PROBE_INDEX`` keyed by ``(qualname, kind)`` for tests / tooling.
       * ``_CODE_PROBE_INDEX`` keyed by ``(code, kind)`` for dispatch —
         aggregates every specifier that resolves to the same code object so
         an aliased function fires every probe pointing at it.
-      * ``_FUNCTIONS_BY_CODE`` ``code -> function`` for synchronous marker
-        attach / clear without re-walking the resolver later.
 
     Line probes appear in ``_PROBE_INDEX`` (so registry-consistency
     invariants keep holding) but are filtered out of the dispatch table
     and monitoring mask — they would over-capture today, see Future-work
     in the design doc. A warning is logged once per probe id.
-
-    Marker attach AND clear happen inside this critical section. Doing
-    it here keeps marker state in lockstep with ``_CODE_PROBE_INDEX``;
-    the previous design did marker attach outside the lock and could
-    strand a sentinel when an uninstall raced in between.
     """
     prev = _instr_module._PROBE_INDEX
 
@@ -167,7 +158,6 @@ def _rebuild_probe_index() -> None:
     qualname_to_resolved: Dict[str, Optional[Any]] = {}
     new_code_index: Dict[Tuple[CodeType, str], list] = {}
     new_codes_to_kinds: Dict[CodeType, Set[str]] = {}
-    new_functions_by_code: Dict[CodeType, Any] = {}
 
     for (qualname, target), pairs in new_index.items():
         if target == "line":
@@ -183,7 +173,6 @@ def _rebuild_probe_index() -> None:
         code = getattr(underlying, "__code__", None)
         if code is None:
             continue
-        new_functions_by_code[code] = underlying
         new_code_index.setdefault((code, target), []).extend(pairs)
         new_codes_to_kinds.setdefault(code, set()).add(target)
 
@@ -191,29 +180,8 @@ def _rebuild_probe_index() -> None:
         k: tuple(v) for k, v in new_code_index.items()
     }
 
-    prev_functions = _instr_module._FUNCTIONS_BY_CODE
-    prev_codes = set(prev_functions)
-    new_codes = set(new_functions_by_code)
-
-    for code in prev_codes - new_codes:
-        fn = prev_functions[code]
-        try:
-            delattr(fn, "__posthog_decorator")
-        except AttributeError:
-            pass
-
-    for code, fn in new_functions_by_code.items():
-        if not hasattr(fn, "__posthog_decorator"):
-            try:
-                fn.__posthog_decorator = _ProbeMarker(code)
-            except Exception:
-                logger.exception(
-                    "failed to attach marker on %r", getattr(fn, "__qualname__", fn)
-                )
-
     _instr_module._PROBE_INDEX = new_index
     _instr_module._CODE_PROBE_INDEX = final_code_index
-    _instr_module._FUNCTIONS_BY_CODE = new_functions_by_code
 
     _instr_module._apply_monitoring(new_codes_to_kinds)
 
@@ -253,12 +221,11 @@ def install_program(program: Program) -> None:
          the program as ``current`` and never retries.
       2. ``_INSTALLED_PROGRAMS[program.id] = program``.
       3. ``_rebuild_probe_index`` rebuilds the qualname / code dispatch
-         tables, attaches markers, and applies the ``sys.monitoring`` diff.
+         tables and applies the ``sys.monitoring`` event-mask diff.
 
-    Per-probe target resolution and marker attachment are part of the
-    rebuild so they happen inside the same critical section as the index
-    update — no race window for a concurrent uninstall to leave a stale
-    sentinel behind.
+    Per-probe target resolution happens inside the rebuild's critical
+    section; ``is_instrumented(fn)`` is the way for callers to check
+    whether a particular function is currently routed.
     """
     with _LOCK:
         _instr_module._ensure_tool_registered()

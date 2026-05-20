@@ -73,16 +73,13 @@ TARGETS = [
 
 
 def _unwrap(fn: Callable[..., Any]) -> None:
-    """Drop the ``__posthog_decorator`` sentinel a test may have set up.
+    """No-op kept for backwards compatibility with older test patterns.
 
-    With ``sys.monitoring``-based dispatch this is just a ``delattr``;
-    the marker is a flag, not a bytecode mutation. Kept as a helper so
-    older test patterns that need explicit cleanup keep working.
+    The sys.monitoring dispatch path doesn't attach any per-function
+    state, so there's nothing to unwind here. The fixture call sites
+    were retained so test files that import ``_unwrap`` still resolve.
     """
-    try:
-        delattr(fn, "__posthog_decorator")
-    except AttributeError:
-        pass
+    del fn
 
 
 # ---------------------------------------------------------------------------
@@ -101,30 +98,16 @@ def _build_program(source: str, program_id: str = "test-prog"):
 
 
 def _drain_registry() -> None:
-    """Tear down every installed program plus any leftover markers.
+    """Uninstall every installed program.
 
     Used as cross-round cleanup inside the stateful machine — Hypothesis
     runs many examples within a single pytest invocation and the
     ``reset_state`` fixture only fires between pytest test cases, not
-    between Hypothesis examples. With synchronous marker cleanup the
-    second loop is just defensive belt-and-suspenders.
+    between Hypothesis examples. ``uninstall_program`` itself does the
+    full dispatch-index + monitoring cleanup for each program.
     """
     for pid in list(instr._INSTALLED_PROGRAMS):
         manager.uninstall_program(pid)
-
-    for _name, obj in list(vars(target_mod).items()):
-        if hasattr(obj, "__posthog_decorator"):
-            try:
-                delattr(obj, "__posthog_decorator")
-            except AttributeError:
-                pass
-        if isinstance(obj, type):
-            for _mname, mobj in list(vars(obj).items()):
-                if hasattr(mobj, "__posthog_decorator"):
-                    try:
-                        delattr(mobj, "__posthog_decorator")
-                    except AttributeError:
-                        pass
 
 
 # Deterministic arg providers for each specifier in _SPECIFIER_POOL. Used by

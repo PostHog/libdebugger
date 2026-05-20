@@ -24,20 +24,17 @@ State model
   object so an aliased function fires all of its probes. The callbacks
   read this directly from the live code object the interpreter hands us.
 
-* ``_FUNCTIONS_BY_CODE`` (``CodeType`` -> function) lets the rebuild path
-  reattach / clear the ``__posthog_decorator`` sentinel without re-walking
-  the dotted-name resolver. Mutated under ``_LOCK``.
-
 * ``_MONITORED_CODES`` (``CodeType`` -> active event mask) tracks what we've
-  enabled on each code object so a reconcile can compute the disable diff.
-  Mutated under ``_LOCK``.
+  enabled on each code object so a reconcile can compute the disable diff,
+  AND is the source of truth for "is this function currently instrumented?"
+  via ``is_instrumented(fn)``. Mutated under ``_LOCK``.
 
-The ``__posthog_decorator`` attribute is kept as a backwards-compatible
-sentinel on instrumented callables. It does NOT carry probe state and does
-NOT mutate ``__code__`` — it's a no-op marker so test invariants and the
-pytest-stress plugin can detect "this function is currently routed through
-the dispatch index". The marker is cleared lazily by the dispatch path on the
-next call after the registry slot for that code object empties.
+There is no per-function sentinel attribute — callers that need to detect
+"is this function currently routed?" call ``is_instrumented(fn)`` which
+checks ``_MONITORED_CODES`` directly. Earlier revisions kept a
+``__posthog_decorator`` marker attribute purely so existing tests and
+tooling could ``hasattr`` for it; that turned out to be code created just
+to satisfy assertions and has been removed.
 """
 
 from __future__ import annotations
@@ -69,8 +66,6 @@ _INSTALLED_PROGRAMS: Dict[str, Program] = {}
 _PROBE_INDEX: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
 
 _CODE_PROBE_INDEX: Dict[Tuple[CodeType, str], Tuple[Tuple[Program, Probe], ...]] = {}
-
-_FUNCTIONS_BY_CODE: Dict[CodeType, Any] = {}
 
 _MONITORED_CODES: Dict[CodeType, int] = {}
 
@@ -136,28 +131,22 @@ def _any_probes_for(qualname: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compatible sentinel attached to instrumented callables.
+# Public helper: detect whether a callable is currently routed.
 # ---------------------------------------------------------------------------
 
 
-class _ProbeMarker:
-    """Sentinel attached as ``fn.__posthog_decorator`` while ``fn`` is routed
-    through the dispatch index.
+def is_instrumented(fn: Any) -> bool:
+    """True iff ``fn`` is currently routed through the dispatch index.
 
-    Carries ``original_code`` so legacy assertions of the form
-    ``dec.original_code`` keep working — but because the sys.monitoring path
-    never mutates ``__code__``, ``original_code`` is just whatever
-    ``fn.__code__`` was at install time. ``cleanup()`` is a no-op for the
-    same reason.
+    Reads ``_MONITORED_CODES`` lock-free. Handles bound methods by
+    walking down to ``__func__``. Useful for the pytest-stress plugin
+    and test assertions; the dispatch path itself uses the code object
+    directly.
     """
-
-    __slots__ = ("original_code",)
-
-    def __init__(self, code: CodeType) -> None:
-        self.original_code = code
-
-    def cleanup(self) -> None:
-        return None
+    if inspect.ismethod(fn):
+        fn = fn.__func__
+    code = getattr(fn, "__code__", None)
+    return code is not None and code in _MONITORED_CODES
 
 
 # ---------------------------------------------------------------------------
@@ -201,18 +190,6 @@ def _run_probes(
                 getattr(probe, "id", "?"),
             )
     return len(probes)
-
-
-# ---------------------------------------------------------------------------
-# Target resolution (kept here because the dispatch state lives here too).
-# ---------------------------------------------------------------------------
-
-
-def resolve_code_for_callable(fn: Any) -> Optional[CodeType]:
-    """Pull the ``CodeType`` for a callable, unwrapping bound methods."""
-    if inspect.ismethod(fn):
-        fn = fn.__func__
-    return getattr(fn, "__code__", None)
 
 
 # ---------------------------------------------------------------------------

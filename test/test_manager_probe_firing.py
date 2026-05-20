@@ -55,10 +55,10 @@ def test_entry_probe_fires_once_per_call(hogtrace_scope, capture_enqueue):
     )
     install_program(program)
 
-    # Sanity: registry populated, fn wrapped.
+    # Sanity: registry populated, fn instrumented.
     assert instr._INSTALLED_PROGRAMS["prog-entry"] is program
     assert ("test.target.fn_a", "entry") in instr._PROBE_INDEX
-    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert instr.is_instrumented(target_mod.fn_a)
 
     # Single call -> exactly one entry-probe enqueue.
     target_mod.fn_a(7)
@@ -183,8 +183,14 @@ def test_multiple_programs_on_same_function(hogtrace_scope, capture_enqueue):
     assert program_ids == {"prog-a", "prog-b"}
 
 
-def test_install_program_creates_wrapper_only_once(hogtrace_scope, capture_enqueue):
-    """Installing two programs targeting the same fn shares one wrapper instance."""
+def test_install_program_keeps_function_instrumented_across_installs(
+    hogtrace_scope, capture_enqueue
+):
+    """Two programs targeting the same fn keep ``is_instrumented`` True throughout.
+
+    Each install merges into the dispatch index without disturbing the
+    monitoring mask on the target's code object.
+    """
     from libdebugger.manager import install_program
 
     prog1 = _build_program(
@@ -196,12 +202,16 @@ def test_install_program_creates_wrapper_only_once(hogtrace_scope, capture_enque
         program_id="prog-shared-2",
     )
     install_program(prog1)
-    dec_after_first = target_mod.fn_a.__posthog_decorator
-    install_program(prog2)
-    dec_after_second = target_mod.fn_a.__posthog_decorator
+    assert instr.is_instrumented(target_mod.fn_a)
+    monitored_after_first = instr._MONITORED_CODES.get(target_mod.fn_a.__code__)
 
-    assert dec_after_first is dec_after_second, (
-        "wrapper should be created on first install and reused on subsequent installs"
+    install_program(prog2)
+    assert instr.is_instrumented(target_mod.fn_a)
+    # Mask grew (exit added) but the code stays monitored without churn.
+    assert instr._MONITORED_CODES.get(target_mod.fn_a.__code__) is not None
+    assert (
+        instr._MONITORED_CODES[target_mod.fn_a.__code__] != monitored_after_first
+        or monitored_after_first is None
     )
 
 

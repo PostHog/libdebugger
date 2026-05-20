@@ -105,26 +105,22 @@ def test_install_uninstall_method_on_class():
     assert klass_instance.method(3) == expected_3
 
 
-def test_marker_cleared_after_uninstall():
-    """``__posthog_decorator`` is gone synchronously after the last uninstall.
-
-    Earlier versions deferred cleanup to the next call; ``sys.monitoring``
-    lets us disable events at uninstall time so the marker comes off too.
-    """
+def test_instrumented_state_cleared_after_uninstall():
+    """``is_instrumented`` flips back to False synchronously after uninstall."""
     fn = target_mod.fn_a
     program = _build_program(
         "fn:test.target.fn_a:entry { }",
         program_id="behavior-marker",
     )
 
-    assert not hasattr(fn, "__posthog_decorator")
+    assert not instr.is_instrumented(fn)
 
     with new_context():
         install_program(program)
-        assert hasattr(fn, "__posthog_decorator")
+        assert instr.is_instrumented(fn)
         uninstall_program(program.id)
 
-    assert not hasattr(fn, "__posthog_decorator")
+    assert not instr.is_instrumented(fn)
 
 
 def test_module_globals_present():
@@ -133,7 +129,6 @@ def test_module_globals_present():
     assert hasattr(instr, "_INSTALLED_PROGRAMS")
     assert hasattr(instr, "_LOCK")
     assert hasattr(instr, "_CODE_PROBE_INDEX")
-    assert hasattr(instr, "_FUNCTIONS_BY_CODE")
     assert hasattr(instr, "_MONITORED_CODES")
     assert instr._PROBE_INDEX == {}
     assert instr._INSTALLED_PROGRAMS == {}
