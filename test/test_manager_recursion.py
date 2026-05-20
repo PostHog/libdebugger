@@ -5,11 +5,10 @@ Property: for a function F that calls itself N times within one outer call,
 ``_enqueue_message`` fires exactly ``N * (entry_count + exit_count)`` times.
 No deadlock, no missed probes, no double-firing.
 
-The frame-stack handling in ``InstrumentationDecorator.__call__`` is what
-makes recursion work — each call pushes its own frame, and the
-``previous_frame_top`` check distinguishes "we pushed a new frame this call"
-from "we didn't." These tests pin that behavior under increasing depth and
-under an exception mid-recursion.
+Each recursive call pushes its own Python frame; ``sys.monitoring``
+delivers an event per frame independently, so the dispatch path doesn't
+need any per-call bookkeeping for recursion to work — the property pins
+that there's no accidental shared state between calls.
 
 Invocation count for ``test.target.fact``:
   fact(N) when N <= 1 returns 1 directly (base case) -> 1 invocation.

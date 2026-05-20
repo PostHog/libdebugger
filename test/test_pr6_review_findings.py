@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any
 
 import pytest
 from hogtrace.context import new_context
 
 import libdebugger.instrumentation as instr
-import libdebugger.manager as manager
 from libdebugger.manager import install_program, uninstall_program
 from test._manager_helpers import _build_program, target_mod
 
@@ -268,50 +266,9 @@ def test_tool_slot_retained_across_release():
     )
 
 
-# ---------------------------------------------------------------------------
-# [P2] Marker attachment must not race with a concurrent uninstall.
-# ---------------------------------------------------------------------------
-
-
-def test_marker_not_stranded_by_concurrent_uninstall(monkeypatch):
-    """Marker attach + uninstall must not race into a stranded sentinel.
-
-    The bug: install_program holds the lock to mutate the registry and
-    rebuild the dispatch index, then releases the lock and walks probes
-    to attach ``__posthog_decorator``. If an uninstall lands between the
-    release and the marker walk, the marker walk re-attaches a sentinel
-    that nothing will ever clear (the dispatch index already disabled
-    events for that code).
-
-    We simulate the race by patching ``resolve_target`` so its second
-    call (the post-lock marker walk) triggers an uninstall before
-    returning. The first call (inside the locked rebuild) is left alone
-    because uninstalling inside the lock would deadlock the test.
-    """
-    program = _build_program(
-        "fn:test.target.fn_a:entry { }",
-        program_id="race-marker",
-    )
-
-    real_resolve = manager.resolve_target
-    call_count = {"n": 0}
-
-    def racy_resolve(spec: str) -> Any:
-        call_count["n"] += 1
-        if call_count["n"] == 2 and "race-marker" in instr._INSTALLED_PROGRAMS:
-            # Simulate a concurrent uninstall landing between
-            # install_program's lock release and its marker walk.
-            uninstall_program("race-marker")
-        return real_resolve(spec)
-
-    monkeypatch.setattr(manager, "resolve_target", racy_resolve)
-
-    install_program(program)
-
-    assert "race-marker" not in instr._INSTALLED_PROGRAMS, (
-        "test invariant: the patched resolve should have driven an uninstall"
-    )
-    assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
-        "P2 race: install must not re-attach a marker after uninstall has "
-        "already cleared it; the dispatch index has no entry to clean it"
-    )
+# The original review also flagged a marker-attach race: install_program
+# attached a __posthog_decorator sentinel OUTSIDE the lock, and a concurrent
+# uninstall could leave a stranded marker. That code path is gone — the
+# marker attribute itself was removed once is_instrumented(fn) replaced
+# it (see commit b0a9d20). No follow-up test is needed because there's
+# no longer anything for the race to leak.

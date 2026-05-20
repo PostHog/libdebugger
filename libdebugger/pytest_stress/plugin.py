@@ -300,10 +300,9 @@ def _instrument_random_functions(terminal_reporter=None):
 def _cleanup_instrumentation():
     """Uninstall every synthetic Program this plugin installed.
 
-    Wrappers self-clean on their next call once the registry slot is empty
-    (see InstrumentationDecorator.__call__'s finally block). We don't tear
-    them down manually here — the manager's lazy-cleanup contract is what
-    the stress plugin is supposed to be stressing.
+    ``uninstall_program`` does the full cleanup (dispatch index, monitoring
+    mask) synchronously inside its critical section — the stress plugin
+    is stressing exactly that path.
     """
     global _tracker, _active_program_ids
 

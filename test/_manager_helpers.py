@@ -146,9 +146,9 @@ def _resolve_target_or_none(specifier: str):
     """Resolve a specifier to its current live callable, or None.
 
     Used inside the stateful machine's call_function rule to look up the
-    function object whose ``__posthog_decorator`` attribute we want to
-    check after the call. We use manager.resolve_target so the lookup
-    semantics match production exactly.
+    function object passed to ``instr.is_instrumented`` for the
+    convergence check. ``manager.resolve_target`` matches production
+    semantics exactly.
     """
     return manager.resolve_target(specifier)
 
