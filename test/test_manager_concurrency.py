@@ -7,9 +7,11 @@ convergence), and 7 (behavior preservation) still hold. No
 ``RuntimeError: dictionary changed size during iteration`` or partial-
 state observations.
 
-These tests exercise the atomic-rebind + per-wrapper-lock discipline
-established in earlier phases. Production code changes here would be a
-sign that an earlier phase landed an unsafe pattern.
+These tests exercise the atomic-rebind discipline used by
+``_rebuild_probe_index``: writers serialize on ``_LOCK`` and whole-dict
+replace ``_PROBE_INDEX`` / ``_CODE_PROBE_INDEX``; the ``sys.monitoring``
+callbacks read lock-free. Production code changes here would be a sign
+that the rebuild path landed an unsafe pattern.
 
 A note on hogtrace request scope: ``hogtrace.context.new_context()`` is
 built on top of ``contextvars.ContextVar``. ``ContextVar`` lookups return

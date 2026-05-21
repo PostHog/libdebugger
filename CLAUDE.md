@@ -33,11 +33,10 @@ The library uses CPython's `sys.monitoring` API (3.12+) to receive events direct
 
 - **Source of truth**: `_INSTALLED_PROGRAMS` (program_id → `Program`) is the only mutable state owned by manager-level operations; everything else is derived. `_rebuild_probe_index` is a pure function of `_INSTALLED_PROGRAMS` — asserted as a Hypothesis property (P5).
 - **Lock-free read path**: writers serialize on `_LOCK`; readers (the `sys.monitoring` callbacks) take no lock. Whole-dict replacement of `_PROBE_INDEX` / `_CODE_PROBE_INDEX` keeps reads atomic under CPython's GIL.
-- **Tuple reuse**: when `_rebuild_probe_index` produces a slot with the same `(program.id, probe.id)` set as the previous index, it reuses the old tuple object so identity-compare-based drift detection stays stable.
 - **Generator semantics**: entry probes fire on `PY_START` AND `PY_RESUME`; exit probes fire on `PY_RETURN`, `PY_YIELD`, and `PY_UNWIND`. v1 (bytecode-rewriting) only fired entry once per outer call — the new behavior is a deliberate, broader trace.
 - **Reentrancy**: CPython suppresses monitoring events for our tool id while one of our callbacks is on the stack, so a probe body that re-enters an instrumented function does NOT recursively fire. Pinned by `test_sys_monitoring.py::test_callback_does_not_reenter_on_self_call` — a future interpreter change there gets caught at test time.
 - **Polling lifecycle**: `HogTraceManager.start()` spawns a `posthoganalytics.poller.Poller` only when `client.personal_api_key` is set. `stop()` snapshots `_INSTALLED_PROGRAMS` keys under `_LOCK`, releases the lock, then iterates `uninstall_program(pid)` — never holding `_LOCK` across calls because the lock is non-reentrant.
-- **Reconcile error isolation**: `_fetch_programs` wraps each per-program install/uninstall/update in its own `try/except` so a single bad program does not abort the cycle. HTTP / parse errors are caught around the whole fetch so the poller keeps spinning.
+- **Reconcile error isolation**: `_fetch_programs` wraps each per-program install/uninstall/update in its own `try/except` so a single bad program does not abort the cycle. HTTP / parse errors are caught around the whole fetch so the poller keeps spinning. The registry snapshot used for diffing is taken under `_LOCK` to keep direct `install_program` / `uninstall_program` calls from racing the reconcile.
 
 ## Development Commands
 
@@ -79,7 +78,7 @@ cd example && uv run flask --app app run
 The test suite uses Hypothesis property tests to pin the spec's invariants:
 
 - `test_manager_behavior.py` — behavior preservation (P7). Install + uninstall is a no-op on return values.
-- `test_manager_probe_firing.py` — trace fidelity (P1) plus `resolve_target` and `_rebuild_probe_index` tuple-reuse coverage.
+- `test_manager_probe_firing.py` — trace fidelity (P1) plus `resolve_target` coverage and `_rebuild_probe_index` behavior.
 - `test_manager_self_cleanup.py` — registry consistency (P2/P3), synchronous cleanup convergence (P4), order-independence (P5).
 - `test_manager_recursion.py` — recursion safety (P6). Hand-written counts for `fact()` / `recur_raise()` plus a Hypothesis sweep.
 - `test_manager_registry_machine.py` — `RegistryMachine` Hypothesis stateful machine. Asserts P2/P3/P4/P5 invariants over arbitrary install/uninstall/update sequences.
@@ -87,7 +86,7 @@ The test suite uses Hypothesis property tests to pin the spec's invariants:
 - `test_manager_concurrency.py` — thread-interleaving stress: worker threads calling instrumented functions while another thread reconciles.
 - `test_manager_integration.py` — end-to-end `HogTraceManager` wiring with mocked HTTP, deadlock-free `stop()`, the no-API-key short-circuit.
 - `test_sys_monitoring.py` — tool-id lifecycle (acquisition, idempotence, fallback chain, conflict refusal, slot retention), generator entry/exit semantics, `PY_UNWIND` delivering the exception, and frame-access via `sys._getframe(2)`.
-- `test_pr6_review_findings.py` — regressions for issues caught during PR #6 review (failed install pollution, aliased-code dispatch, line-probe filtering, tool-slot fallback, marker-race).
+- `test_pr6_review_findings.py` — regressions for issues caught during PR #6 review (failed install pollution, aliased-code dispatch, line-probe filtering, tool-slot fallback).
 - `test_example_app_status.py` — regression for the example Flask app's status snapshot using `is_instrumented`.
 - `test_strategies.py` — meta-tests for the Hypothesis strategies in `test/strategies.py`.
 

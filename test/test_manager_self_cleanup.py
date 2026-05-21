@@ -122,11 +122,11 @@ def test_uninstall_unknown_program_id_is_silent():
 
 
 def test_self_cleanup_after_uninstall(hogtrace_scope):
-    """Install -> uninstall: marker comes off synchronously, ``__code__`` is unchanged.
+    """Install -> uninstall: ``is_instrumented`` flips back synchronously, ``__code__`` is unchanged.
 
     With ``sys.monitoring``-based dispatch ``uninstall_program`` disables
-    events on the target's code object and clears the sentinel attribute
-    in the same critical section. ``__code__`` is never modified.
+    events on the target's code object in the same critical section as
+    the registry update. ``__code__`` is never modified.
     """
     from libdebugger.manager import install_program, uninstall_program
 

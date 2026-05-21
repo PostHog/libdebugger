@@ -220,8 +220,9 @@ def uninstall_program(program_id: str) -> None:
     """Remove ``program_id`` and rebuild the dispatch tables.
 
     Silent no-op on an unknown id so reconcile-diff loops can issue
-    uninstall unconditionally. Sentinel markers are cleared lazily inside
-    the dispatch callbacks on the next call after the registry slot empties.
+    uninstall unconditionally. ``_rebuild_probe_index`` calls
+    ``_apply_monitoring``, which disables ``sys.monitoring`` events on any
+    code that left the dispatch table — synchronous cleanup, no markers.
     """
     with _LOCK:
         _instr_module._INSTALLED_PROGRAMS.pop(program_id, None)
@@ -344,7 +345,12 @@ class HogTraceManager:
             logger.exception("Failed to fetch programs")
             return
 
-        current_ids = set(_instr_module._INSTALLED_PROGRAMS)
+        with _LOCK:
+            current_hashes = {
+                pid: program.hash
+                for pid, program in _instr_module._INSTALLED_PROGRAMS.items()
+            }
+        current_ids = set(current_hashes)
         incoming_ids = set(incoming)
 
         for pid in current_ids - incoming_ids:
@@ -359,7 +365,7 @@ class HogTraceManager:
                 logger.exception("Failed to install program %s", pid)
         for pid in current_ids & incoming_ids:
             try:
-                if _instr_module._INSTALLED_PROGRAMS[pid].hash != incoming[pid].hash:
+                if current_hashes[pid] != incoming[pid].hash:
                     update_program(incoming[pid])
             except Exception:
                 logger.exception("Failed to update program %s", pid)
