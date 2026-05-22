@@ -27,7 +27,10 @@ from test._manager_helpers import (
     _CALL_ARGS_BY_SPECIFIER,
     _any_qualname_probed_in_index,
     _drain_registry,
+    _expected_code_probe_index_from_programs,
+    _expected_monitored_codes_from_programs,
     _normalize_from_programs,
+    _normalized_code_probe_index,
     _normalized_index,
     _resolve_target_or_none,
 )
@@ -149,6 +152,20 @@ class RegistryMachine(RuleBasedStateMachine):
         self._model[existing_id] = forged
         return existing_id
 
+    @rule(target=program_ids, existing_id=program_ids, program=programs_strategy())
+    def update_existing(self, existing_id, program):
+        # Sibling of install_overwriting that exercises the public
+        # ``update_program`` entrypoint on an in-use id. The random-UUID
+        # strategy makes update_program against a known id effectively
+        # impossible to hit otherwise; without this rule, the state
+        # machine's random walk almost never touches the same-id update
+        # path the manager treats as the canonical "swap the probe set"
+        # operation.
+        forged = ht_package(existing_id, program.program_bytecode)
+        manager.update_program(forged)
+        self._model[existing_id] = forged
+        return existing_id
+
     @invariant()
     def registry_consistent(self):
         # P2: the set of installed program ids matches the model exactly.
@@ -201,6 +218,41 @@ class RegistryMachine(RuleBasedStateMachine):
         actual = _normalized_index()
         assert expected == actual, (
             f"_PROBE_INDEX diverged from model rebuild. "
+            f"expected={expected!r} actual={actual!r}"
+        )
+
+    @invariant()
+    def code_probe_index_matches_model_rebuild(self):
+        """Actual ``_CODE_PROBE_INDEX`` == code-keyed rebuild from the model.
+
+        ``_PROBE_INDEX`` is the qualname-keyed view; ``_CODE_PROBE_INDEX``
+        is what the ``sys.monitoring`` callbacks actually read. A bug that
+        only corrupted the dispatch table (aliased-code dropping a probe,
+        an unresolvable specifier polluting the dispatch path, line probes
+        leaking through) would pass the qualname-keyed invariants but
+        break this one.
+        """
+        expected = _expected_code_probe_index_from_programs(self._model.values())
+        actual = _normalized_code_probe_index()
+        assert expected == actual, (
+            f"_CODE_PROBE_INDEX diverged from model rebuild. "
+            f"expected={expected!r} actual={actual!r}"
+        )
+
+    @invariant()
+    def monitored_codes_matches_model_rebuild(self):
+        """Actual ``_MONITORED_CODES`` == event-mask rebuild from the model.
+
+        Catches drift between the dispatch table and what
+        ``sys.monitoring`` actually has enabled — e.g. a code that left
+        the dispatch table but never got ``set_local_events(..., 0)``, or
+        an entry-only probe enabling exit events because the kind set was
+        computed incorrectly.
+        """
+        expected = _expected_monitored_codes_from_programs(self._model.values())
+        actual = dict(instr._MONITORED_CODES)
+        assert expected == actual, (
+            f"_MONITORED_CODES diverged from model rebuild. "
             f"expected={expected!r} actual={actual!r}"
         )
 

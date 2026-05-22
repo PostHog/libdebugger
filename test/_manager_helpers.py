@@ -200,6 +200,87 @@ def _normalize_from_programs(
     return {key: frozenset(pairs) for key, pairs in out.items()}
 
 
+def _normalized_code_probe_index() -> Dict[Tuple[Any, str], FrozenSet[Tuple[str, str]]]:
+    """Map each ``_CODE_PROBE_INDEX`` slot to a frozenset of ``(program.id, probe.id)``.
+
+    Mirror of ``_normalized_index`` for the code-keyed dispatch table.
+    """
+    return {
+        key: frozenset((p.id, pr.id) for p, pr in pairs)
+        for key, pairs in instr._CODE_PROBE_INDEX.items()
+    }
+
+
+def _resolve_specifier_to_code(specifier: str):
+    """Walk a specifier to the underlying ``CodeType`` via ``resolve_target``,
+    returning ``None`` if the specifier doesn't resolve or the resolved
+    callable has no ``__code__``.
+
+    Used by the code-keyed model-rebuild helpers so they match exactly what
+    ``_rebuild_probe_index`` does to populate the dispatch table.
+    """
+    import inspect as _inspect
+
+    fn = manager.resolve_target(specifier)
+    if fn is None:
+        return None
+    underlying = fn.__func__ if _inspect.ismethod(fn) else fn
+    return getattr(underlying, "__code__", None)
+
+
+def _expected_code_probe_index_from_programs(
+    programs: Iterable[Any],
+) -> Dict[Tuple[Any, str], FrozenSet[Tuple[str, str]]]:
+    """What ``_CODE_PROBE_INDEX`` should hold given an iterable of Programs.
+
+    Line probes and unresolvable specifiers are dropped — matching the
+    manager's rebuild filter — and aliased specifiers aggregate into the
+    same ``(code, kind)`` slot.
+    """
+    out: Dict[Tuple[Any, str], set] = {}
+    for program in programs:
+        for probe in program.probes:
+            target = probe.spec.target
+            if target == "line":
+                continue
+            code = _resolve_specifier_to_code(probe.spec.specifier)
+            if code is None:
+                continue
+            out.setdefault((code, target), set()).add((program.id, probe.id))
+    return {key: frozenset(pairs) for key, pairs in out.items()}
+
+
+def _expected_monitored_codes_from_programs(
+    programs: Iterable[Any],
+) -> Dict[Any, int]:
+    """What ``_MONITORED_CODES`` (code -> event mask) should hold for these programs.
+
+    Computes the entry/exit mask from the set of kinds present in the
+    derived code-probe index. Mirrors ``_apply_monitoring`` exactly.
+    """
+    kinds_by_code: Dict[Any, set] = {}
+    for program in programs:
+        for probe in program.probes:
+            target = probe.spec.target
+            if target == "line":
+                continue
+            code = _resolve_specifier_to_code(probe.spec.specifier)
+            if code is None:
+                continue
+            kinds_by_code.setdefault(code, set()).add(target)
+
+    expected: Dict[Any, int] = {}
+    for code, kinds in kinds_by_code.items():
+        mask = 0
+        if "entry" in kinds:
+            mask |= instr._ENTRY_EVENT_MASK
+        if "exit" in kinds:
+            mask |= instr._EXIT_EVENT_MASK
+        if mask:
+            expected[code] = mask
+    return expected
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 — recursion invocation counter.
 # ---------------------------------------------------------------------------
@@ -222,8 +303,11 @@ __all__ = [
     "_any_qualname_probed_in_index",
     "_build_program",
     "_drain_registry",
+    "_expected_code_probe_index_from_programs",
     "_expected_fact_invocations",
+    "_expected_monitored_codes_from_programs",
     "_normalize_from_programs",
+    "_normalized_code_probe_index",
     "_normalized_index",
     "_resolve_target_or_none",
     "_unwrap",
