@@ -16,7 +16,7 @@ class InstrumentationRecord:
 
     function: Callable
     function_info: dict
-    decorator: Any  # InstrumentationDecorator instance
+    decorator: Any  # legacy field, always None in sys.monitoring-based dispatch
     instrumented_at: datetime = field(default_factory=datetime.now)
     executed: bool = False
     execution_count: int = 0
@@ -127,33 +127,16 @@ class InstrumentationTracker:
         return len(self.get_executed_records()) > 0
 
     def cleanup_instrumentation(self, func: Callable) -> None:
-        """Clean up instrumentation for a specific function."""
+        """Drop the tracker record for a function. The dispatch lifecycle
+        is owned by ``manager.uninstall_program`` — this only removes the
+        tracker's bookkeeping entry.
+        """
         func_id = id(func)
-
         if func_id in self.records:
-            record = self.records[func_id]
-
-            # Call cleanup on the decorator
-            try:
-                record.decorator.cleanup()
-            except Exception as e:
-                print(
-                    f"Warning: Failed to cleanup instrumentation for {record.function_info['name']}: {e}"
-                )
-
-            # Remove from active set
             self.active_instrumentations.discard(func_id)
 
     def cleanup_all(self) -> None:
-        """Clean up all active instrumentations."""
-        for func_id in list(self.active_instrumentations):
-            if func_id in self.records:
-                record = self.records[func_id]
-                try:
-                    record.decorator.cleanup()
-                except Exception as e:
-                    print(f"Warning: Failed to cleanup instrumentation: {e}")
-
+        """Drop all tracker records. Same lifecycle note as ``cleanup_instrumentation``."""
         self.active_instrumentations.clear()
         self.records.clear()
 

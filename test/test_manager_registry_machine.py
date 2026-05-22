@@ -27,7 +27,10 @@ from test._manager_helpers import (
     _CALL_ARGS_BY_SPECIFIER,
     _any_qualname_probed_in_index,
     _drain_registry,
+    _expected_code_probe_index_from_programs,
+    _expected_monitored_codes_from_programs,
     _normalize_from_programs,
+    _normalized_code_probe_index,
     _normalized_index,
     _resolve_target_or_none,
 )
@@ -95,57 +98,41 @@ class RegistryMachine(RuleBasedStateMachine):
 
     @rule(specifier=st.sampled_from(_SPECIFIER_POOL))
     def call_function(self, specifier):
-        """Call a target function once; assert wrapped IFF probed for it.
+        """Call a target function once; assert instrumented IFF probes exist for it.
 
-        This is the P4 convergence probe. After the call:
-          - If probes exist for ``specifier`` in _PROBE_INDEX, the wrapper
-            must still be in place (``__posthog_decorator`` present).
-          - If no probes exist for ``specifier``, the call must have
-            triggered self-uninstall (``__posthog_decorator`` absent AND
-            ``__code__`` restored to the original).
-
-        The assertion runs INSIDE the rule rather than as a global
-        ``@invariant`` because the "wrapper still in place but registry
-        empty" state is legal BETWEEN an uninstall rule and the next
-        call_function rule. Only after the call do we expect convergence.
+        This is the P4 convergence probe. With sys.monitoring-based
+        dispatch the cleanup happens synchronously inside
+        ``uninstall_program``, so the convergence holds after any
+        install/uninstall, with or without a call.
         """
         fn = _resolve_target_or_none(specifier)
         if fn is None:
-            # Specifier doesn't resolve (shouldn't happen for fixed pool,
-            # but guard anyway so the rule can't blow up the machine).
             return
 
-        # Snapshot original code if the function isn't currently wrapped,
-        # so we can check __code__ is the original after a self-uninstall.
-        # When wrapped, fn.__code__ is the redirector; the original code
-        # is stored on the decorator.
-        dec_before = getattr(fn, "__posthog_decorator", None)
-        original_code = (
-            dec_before.original_code if dec_before is not None else fn.__code__
-        )
+        original_code = fn.__func__.__code__ if hasattr(fn, "__func__") else fn.__code__
 
         args = _CALL_ARGS_BY_SPECIFIER[specifier]
         try:
             fn(*args)
         except Exception:
-            # Probe path is allowed to log+swallow; user-code exceptions
-            # from target functions (none of ours raise on these args, but
-            # belt-and-suspenders) propagate through the wrapper and we
-            # catch them here so the machine keeps marching.
+            # User-code exceptions from target functions propagate; we
+            # catch them so the machine keeps marching.
             pass
 
-        # P4 convergence: wrapper present IFF probes exist for this qualname.
-        has_attr = hasattr(fn, "__posthog_decorator")
+        # P4 convergence: code monitored IFF probes exist for this qualname.
+        has_monitoring = instr.is_instrumented(fn)
         has_probes = _any_qualname_probed_in_index(specifier)
-        assert has_attr == has_probes, (
+        assert has_monitoring == has_probes, (
             f"P4 convergence violated after calling {specifier}: "
-            f"hasattr(__posthog_decorator)={has_attr}, "
-            f"has_probes_in_index={has_probes}. Wrapper must exist IFF probes do."
+            f"is_instrumented={has_monitoring}, "
+            f"has_probes_in_index={has_probes}. Both must agree."
         )
 
-        # And on the false-side, __code__ must be back to the original.
-        if not has_attr:
-            assert fn.__code__ is original_code, (
+        # __code__ is never mutated under sys.monitoring.
+        if not has_monitoring:
+            assert (
+                fn.__func__.__code__ if hasattr(fn, "__func__") else fn.__code__
+            ) is original_code, (
                 f"P4 convergence: after self-cleanup for {specifier}, "
                 f"__code__ must be the original code object"
             )
@@ -162,6 +149,20 @@ class RegistryMachine(RuleBasedStateMachine):
         forged = ht_package(existing_id, program.program_bytecode)
         manager.install_program(forged)
         # Mirror in the model: same id, new probes -> dict overwrite.
+        self._model[existing_id] = forged
+        return existing_id
+
+    @rule(target=program_ids, existing_id=program_ids, program=programs_strategy())
+    def update_existing(self, existing_id, program):
+        # Sibling of install_overwriting that exercises the public
+        # ``update_program`` entrypoint on an in-use id. The random-UUID
+        # strategy makes update_program against a known id effectively
+        # impossible to hit otherwise; without this rule, the state
+        # machine's random walk almost never touches the same-id update
+        # path the manager treats as the canonical "swap the probe set"
+        # operation.
+        forged = ht_package(existing_id, program.program_bytecode)
+        manager.update_program(forged)
         self._model[existing_id] = forged
         return existing_id
 
@@ -217,6 +218,41 @@ class RegistryMachine(RuleBasedStateMachine):
         actual = _normalized_index()
         assert expected == actual, (
             f"_PROBE_INDEX diverged from model rebuild. "
+            f"expected={expected!r} actual={actual!r}"
+        )
+
+    @invariant()
+    def code_probe_index_matches_model_rebuild(self):
+        """Actual ``_CODE_PROBE_INDEX`` == code-keyed rebuild from the model.
+
+        ``_PROBE_INDEX`` is the qualname-keyed view; ``_CODE_PROBE_INDEX``
+        is what the ``sys.monitoring`` callbacks actually read. A bug that
+        only corrupted the dispatch table (aliased-code dropping a probe,
+        an unresolvable specifier polluting the dispatch path, line probes
+        leaking through) would pass the qualname-keyed invariants but
+        break this one.
+        """
+        expected = _expected_code_probe_index_from_programs(self._model.values())
+        actual = _normalized_code_probe_index()
+        assert expected == actual, (
+            f"_CODE_PROBE_INDEX diverged from model rebuild. "
+            f"expected={expected!r} actual={actual!r}"
+        )
+
+    @invariant()
+    def monitored_codes_matches_model_rebuild(self):
+        """Actual ``_MONITORED_CODES`` == event-mask rebuild from the model.
+
+        Catches drift between the dispatch table and what
+        ``sys.monitoring`` actually has enabled — e.g. a code that left
+        the dispatch table but never got ``set_local_events(..., 0)``, or
+        an entry-only probe enabling exit events because the kind set was
+        computed incorrectly.
+        """
+        expected = _expected_monitored_codes_from_programs(self._model.values())
+        actual = dict(instr._MONITORED_CODES)
+        assert expected == actual, (
+            f"_MONITORED_CODES diverged from model rebuild. "
             f"expected={expected!r} actual={actual!r}"
         )
 

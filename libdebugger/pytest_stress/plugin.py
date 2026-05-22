@@ -10,6 +10,7 @@ from typing import Optional, List
 
 import pytest
 
+from libdebugger import instrumentation as _instr
 from libdebugger import manager as _manager
 from hogtrace.vm import compile as hogtrace_compile, package
 from hogtrace.context import new_context
@@ -257,25 +258,23 @@ def _instrument_random_functions(terminal_reporter=None):
 
     _active_program_ids.append(program_id)
 
-    # Record what the manager actually wrapped. install_program logs and
-    # skips per-probe resolution failures; we mirror that by only
-    # recording entries whose function actually got a __posthog_decorator
-    # attribute (i.e., the wrapper landed).
+    # Record what the manager actually instrumented. install_program logs
+    # and skips per-probe resolution failures; we mirror that by checking
+    # ``is_instrumented`` — true iff the function's code object is in
+    # ``_MONITORED_CODES`` (the source of truth for "routed through
+    # dispatch").
     instrumented_functions = []
     instrumented_count = 0
     for specifier in specifiers:
         func = by_specifier_func[specifier]
-        if not hasattr(func, "__posthog_decorator"):
+        if not _instr.is_instrumented(func):
             continue
         function_info = by_specifier_info[specifier]
-        # The tracker's API still expects a "decorator" object; pass the
-        # one the manager just installed so cleanup_all (if it ever fires)
-        # has something callable. We don't actually need it for cleanup —
-        # uninstall_program owns the lifecycle now — but the tracker uses
-        # it for stats and reporting.
-        decorator = getattr(func, "__posthog_decorator")
+        # ``tracker.add_instrumentation`` keeps a per-function record; pass
+        # None for the legacy decorator slot. cleanup happens via
+        # ``uninstall_program``, so the tracker doesn't need a handle here.
         _tracker.add_instrumentation(
-            func, decorator, function_info, probe_source=probe_source
+            func, None, function_info, probe_source=probe_source
         )
         instrumented_functions.append(function_info)
         instrumented_count += 1
@@ -301,10 +300,9 @@ def _instrument_random_functions(terminal_reporter=None):
 def _cleanup_instrumentation():
     """Uninstall every synthetic Program this plugin installed.
 
-    Wrappers self-clean on their next call once the registry slot is empty
-    (see InstrumentationDecorator.__call__'s finally block). We don't tear
-    them down manually here — the manager's lazy-cleanup contract is what
-    the stress plugin is supposed to be stressing.
+    ``uninstall_program`` does the full cleanup (dispatch index, monitoring
+    mask) synchronously inside its critical section — the stress plugin
+    is stressing exactly that path.
     """
     global _tracker, _active_program_ids
 

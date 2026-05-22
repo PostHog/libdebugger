@@ -3,7 +3,8 @@
 What you get when this starts:
 
 * The functions in ``services.py`` are valid probe targets — their
-  qualnames line up with ``example.services.<name>``.
+  qualnames line up with ``services.<name>`` (the app's import path
+  resolves the module as plain ``services``, not ``example.services``).
 * ``probes.py`` compiles a small set of probes and installs them at
   startup so probe firing is observable without a PostHog server.
 * Every request runs inside a hogtrace request scope so probes have a
@@ -43,12 +44,12 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 from flask import Flask, g, jsonify, request  # noqa: E402
 
 import libdebugger  # noqa: E402
-from libdebugger import instrumentation as _instr  # noqa: E402
 from libdebugger.manager import HogTraceManager  # noqa: E402
 from hogtrace.context import new_context  # noqa: E402
 
 import probes  # noqa: E402
 import services  # noqa: E402
+import status  # noqa: E402
 
 
 logging.basicConfig(
@@ -221,20 +222,9 @@ def slow(n: int):
 @app.get("/_libdebugger/status")
 def libdebugger_status():
     """Snapshot of what's installed in libdebugger's registry."""
-    return {
-        "installed_programs": list(_instr._INSTALLED_PROGRAMS.keys()),
-        "probe_index": {
-            f"{qualname}:{kind}": [(p.id, pr.id) for p, pr in pairs]
-            for (qualname, kind), pairs in _instr._PROBE_INDEX.items()
-        },
-        "wrapped_functions": [
-            name
-            for name, obj in vars(services).items()
-            if hasattr(obj, "__posthog_decorator")
-        ],
-        "event_sink": "configured" if _instr._EVENT_SINK is not None else "none",
-        "manager_running": _manager is not None and _manager.enabled,
-    }
+    snapshot = status.build_status_snapshot()
+    snapshot["manager_running"] = _manager is not None and _manager.enabled
+    return snapshot
 
 
 # ---------------------------------------------------------------------------

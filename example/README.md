@@ -37,7 +37,7 @@ You should see something like:
 | GET    | `/users/<id>/orders`          | List orders for a user.                     |
 | POST   | `/orders`                     | Create an order. Body: `{user_id, item, qty}`. |
 | GET    | `/slow/<n>`                   | Slow path; useful for exit-probe timing.    |
-| GET    | `/_libdebugger/status`        | Dump the registry / wrapped functions.      |
+| GET    | `/_libdebugger/status`        | Dump the registry + instrumented functions. |
 
 ## Try it
 
@@ -45,14 +45,14 @@ In local mode you'll see captures hit stderr as probes fire:
 
 ```
 curl http://127.0.0.1:5000/users/1
-# [probe] $hogtrace_capture program=local-0 probe=probe_0 spec={'specifier': 'example.services.get_user', 'target': 'entry'} captures={"user_id": 1}
-# [probe] $hogtrace_capture program=local-0 probe=probe_1 spec={'specifier': 'example.services.get_user', 'target': 'exit'} captures={"user_id": 1}
+# [probe] $hogtrace_capture program=local-0 probe=probe_0 spec={'specifier': 'services.get_user', 'target': 'entry'} captures={"user_id": 1}
+# [probe] $hogtrace_capture program=local-0 probe=probe_1 spec={'specifier': 'services.get_user', 'target': 'exit'} captures={"user_id": 1}
 
 curl http://127.0.0.1:5000/_libdebugger/status | jq .
 # {
 #   "installed_programs": ["local-0", "local-1", "local-2"],
-#   "probe_index": { "example.services.get_user:entry": [["local-0", "probe_0"]], ... },
-#   "wrapped_functions": ["create_order", "get_user", "slow_compute"],
+#   "probe_index": { "services.get_user:entry": [["local-0", "probe_0"]], ... },
+#   "instrumented_functions": ["create_order", "get_user", "slow_compute"],
 #   "event_sink": "configured",
 #   "manager_running": false
 # }
@@ -64,10 +64,11 @@ only spins up when `POSTHOG_PERSONAL_API_KEY` is set.
 ## Iterating on probes
 
 Edit `LOCAL_PROBE_SOURCES` in `probes.py` and bounce the server. The
-hand-written probes target service functions by their fully-qualified
-name (`example.services.get_user`, etc.) — make sure any new probe's
-specifier resolves to a real function or you'll see a "not resolvable"
-warning at install time.
+hand-written probes target service functions by their import-resolvable
+name as the example sees them (`services.get_user`, not
+`example.services.get_user`, because `app.py` does `import services`
+directly) — make sure any new probe's specifier resolves to a real
+function or you'll see a "not resolvable" warning at install time.
 
 For PostHog-connected iteration, set the env vars and the manager will
 poll the control plane every 30s, picking up program changes

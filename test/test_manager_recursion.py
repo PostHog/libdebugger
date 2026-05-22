@@ -5,11 +5,10 @@ Property: for a function F that calls itself N times within one outer call,
 ``_enqueue_message`` fires exactly ``N * (entry_count + exit_count)`` times.
 No deadlock, no missed probes, no double-firing.
 
-The frame-stack handling in ``InstrumentationDecorator.__call__`` is what
-makes recursion work — each call pushes its own frame, and the
-``previous_frame_top`` check distinguishes "we pushed a new frame this call"
-from "we didn't." These tests pin that behavior under increasing depth and
-under an exception mid-recursion.
+Each recursive call pushes its own Python frame; ``sys.monitoring``
+delivers an event per frame independently, so the dispatch path doesn't
+need any per-call bookkeeping for recursion to work — the property pins
+that there's no accidental shared state between calls.
 
 Invocation count for ``test.target.fact``:
   fact(N) when N <= 1 returns 1 directly (base case) -> 1 invocation.
@@ -66,7 +65,7 @@ def test_recursion_entry_probe_fires_N_times(hogtrace_scope, capture_enqueue):
         program_id="prog-rec-entry",
     )
     install_program(program)
-    assert hasattr(target_mod.fact, "__posthog_decorator")
+    assert instr.is_instrumented(target_mod.fact)
 
     for n in (0, 1, 2, 5, 10):
         del capture_enqueue[:]  # reset between sub-cases
@@ -242,14 +241,6 @@ def test_recursion_probe_count_proportional_to_depth(depth):
                 target_mod.fact(depth)
             finally:
                 manager.uninstall_program("prog-rec-hyp")
-                # Force lazy self-cleanup so the next Hypothesis example
-                # starts from an unwrapped function.
-                fn = manager.resolve_target("test.target.fact")
-                if fn is not None and hasattr(fn, "__posthog_decorator"):
-                    try:
-                        target_mod.fact(0)
-                    except Exception:
-                        pass
     finally:
         instr._enqueue_message = original_enqueue
 

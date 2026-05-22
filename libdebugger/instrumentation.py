@@ -1,53 +1,111 @@
+"""
+Runtime dispatch for libdebugger probes, backed by PEP 669 ``sys.monitoring``.
+
+Replaces the previous bytecode-rewriting decorator (kept in
+``libdebugger/bytecode.py`` for reference). The interpreter calls module-level
+event handlers directly with the user code's frame already on the stack; the
+handlers look up the probe set for the running code object and dispatch.
+
+State model
+-----------
+
+* ``_INSTALLED_PROGRAMS`` (program_id -> ``Program``) is the source of truth.
+  Mutated under ``_LOCK``.
+
+* ``_PROBE_INDEX`` (``(qualname, kind)`` -> tuple of ``(Program, Probe)``) is
+  derived from ``_INSTALLED_PROGRAMS`` by ``_rebuild_probe_index`` in the
+  manager. Atomic-rebound; kept for tests / tooling that key by specifier.
+  Two specifiers can resolve to the same code object (aliases, inherited
+  methods); this index keeps them separate.
+
+* ``_CODE_PROBE_INDEX`` (``(CodeType, kind)`` -> tuple of ``(Program, Probe)``)
+  is the actual dispatch table. Atomic-rebound alongside ``_PROBE_INDEX``.
+  Aggregates probes from every specifier that resolves to a given code
+  object so an aliased function fires all of its probes. The callbacks
+  read this directly from the live code object the interpreter hands us.
+
+* ``_MONITORED_CODES`` (``CodeType`` -> active event mask) tracks what we've
+  enabled on each code object so a reconcile can compute the disable diff,
+  AND is the source of truth for "is this function currently instrumented?"
+  via ``is_instrumented(fn)``. Mutated under ``_LOCK``.
+
+There is no per-function sentinel attribute — callers that need to detect
+"is this function currently routed?" call ``is_instrumented(fn)`` which
+checks ``_MONITORED_CODES`` directly. Earlier revisions kept a
+``__posthog_decorator`` marker attribute purely so existing tests and
+tooling could ``hasattr`` for it; that turned out to be code created just
+to satisfy assertions and has been removed.
+"""
+
+from __future__ import annotations
+
 import datetime
-import logging
-import threading
-import sys
 import inspect
-from typing import Callable, Final, Optional, Dict, List, Any, Tuple
-from types import CodeType, FrameType, FunctionType
+import logging
+import sys
+import threading
+from types import CodeType, FrameType
+from typing import Any, Callable, Dict, Final, Optional, Set, Tuple
 
-from hogtrace import Probe, Program, execute_probe, get_store, get_scope, ProbeSpec
-
-from libdebugger.bytecode import (
-    EntrypointInjector,
-    generate_code_call_self_method,
-    redirector_code,
-)
+from hogtrace import Probe, Program, ProbeSpec, execute_probe, get_scope, get_store
 
 
 logger = logging.getLogger("libdebugger.instrumentation")
 
 
 # ---------------------------------------------------------------------------
-# Module-level registry state.
-#
-# The wrapper's hot path reads ``_PROBE_INDEX`` without holding any lock —
-# the dict is atomic-rebound whenever the manager reconciles a new program
-# list (see ``_rebuild_probe_index`` in ``manager.py``). Writers serialize
-# against each other via ``_LOCK``; readers never block writers and never
-# block each other.
-#
-# In Phase 1 these are populated by no-one; both dicts stay empty. Phase 2
-# wires the manager's free functions to fill them.
+# Module-level dispatch state. Writers serialize on ``_LOCK``; hot-path reads
+# (the sys.monitoring callbacks) take no lock at all — atomic-rebind of the
+# index dicts is safe under CPython's GIL.
 # ---------------------------------------------------------------------------
 
 _LOCK: threading.Lock = threading.Lock()
 
-# program_id -> Program; mutated in place under _LOCK.
-_INSTALLED_PROGRAMS: Dict[str, Any] = {}
+_INSTALLED_PROGRAMS: Dict[str, Program] = {}
 
-# (qualname, "entry" | "exit" | "line") -> tuple of (Program, Probe).
-# Atomic-rebound; never mutated in place. Hot-path reads are lock-free.
 _PROBE_INDEX: Dict[Tuple[str, str], Tuple[Tuple[Program, Probe], ...]] = {}
 
-# Pluggable destination for probe-capture events. The signature is
-# ``sink(event_name: str, properties: Dict[str, Any]) -> None``. By
-# default this is ``None`` — captures are dropped (with a debug log)
-# until something registers a sink. ``HogTraceManager.__init__`` wires
-# ``client.capture`` here automatically when constructed with a client
-# that exposes that method; users wanting full control can override via
-# ``libdebugger.set_event_sink(...)``.
+_CODE_PROBE_INDEX: Dict[Tuple[CodeType, str], Tuple[Tuple[Program, Probe], ...]] = {}
+
+_MONITORED_CODES: Dict[CodeType, int] = {}
+
 _EVENT_SINK: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
+
+# ---------------------------------------------------------------------------
+# Tool-id lifecycle. PEP 669 reserves ids 0 (DEBUGGER_ID), 1 (COVERAGE_ID),
+# 2 (PROFILER_ID), 5 (OPTIMIZER_ID); slots 3 and 4 are for ad-hoc tools.
+# We prefer the ad-hoc slots first so we stay out of the way of pdb /
+# debugpy / coverage by default, then fall through every reserved slot
+# before giving up — refusing to install when even one slot might still
+# be free would be worse than borrowing a reserved slot that isn't in
+# use. Once acquired the slot is held for the lifetime of the process —
+# ``_release_tool`` disables events but keeps ownership so a start/stop
+# cycle doesn't churn callback registration or open a window where
+# another tool can grab our slot.
+# ---------------------------------------------------------------------------
+
+_TOOL_NAME: Final[str] = "libdebugger"
+_TOOL_CANDIDATES: Final[Tuple[int, ...]] = (
+    3,
+    4,
+    sys.monitoring.DEBUGGER_ID,
+    sys.monitoring.COVERAGE_ID,
+    sys.monitoring.PROFILER_ID,
+    sys.monitoring.OPTIMIZER_ID,
+)
+_TOOL_ID: int = -1  # populated by _ensure_tool_registered
+_TOOL_REGISTERED: bool = False
+_CALLBACKS_REGISTERED: bool = False
+
+_EVENTS = sys.monitoring.events
+
+# Per-code (local) events. PY_UNWIND is global-only in CPython's
+# sys.monitoring; we enable it via set_events in _ensure_tool_registered
+# and filter by code object inside the callback.
+_ENTRY_EVENT_MASK: Final[int] = _EVENTS.PY_START | _EVENTS.PY_RESUME
+_EXIT_EVENT_MASK: Final[int] = _EVENTS.PY_RETURN | _EVENTS.PY_YIELD
+_GLOBAL_EVENT_MASK: Final[int] = _EVENTS.PY_UNWIND
 
 
 def set_event_sink(
@@ -55,27 +113,37 @@ def set_event_sink(
 ) -> None:
     """Register (or clear) the callable that receives probe-capture events.
 
-    The sink is invoked as ``sink(event_name, properties)`` once per probe
-    fire. Pass ``None`` to disable event emission entirely (captures are
-    then dropped with a debug log).
-
-    This is a global setting — there is one event sink per process. The
-    normal wiring is automatic via ``HogTraceManager``; call this directly
-    only for tests, alternate sinks (queue / file / stdout), or to plug in
-    a PostHog SDK whose ``capture`` signature differs from the default.
+    Invoked as ``sink(event_name, properties)`` once per probe fire. Pass
+    ``None`` to drop captures with a debug log. ``HogTraceManager`` wires
+    this automatically when its client exposes ``.capture``.
     """
     global _EVENT_SINK
     _EVENT_SINK = sink
 
 
-def _any_probes_for(qualname: str) -> bool:
-    """True if any entry/exit/line probe is registered for ``qualname``."""
-    index = _PROBE_INDEX
-    return bool(
-        index.get((qualname, "entry"))
-        or index.get((qualname, "exit"))
-        or index.get((qualname, "line"))
-    )
+# ---------------------------------------------------------------------------
+# Public helper: detect whether a callable is currently routed.
+# ---------------------------------------------------------------------------
+
+
+def is_instrumented(fn: Any) -> bool:
+    """True iff ``fn`` is currently routed through the dispatch index.
+
+    Reads ``_MONITORED_CODES`` lock-free. Handles bound methods by
+    walking down to ``__func__``. Useful for the pytest-stress plugin
+    and test assertions; the dispatch path itself uses the code object
+    directly.
+    """
+    if inspect.ismethod(fn):
+        fn = fn.__func__
+    code = getattr(fn, "__code__", None)
+    return code is not None and code in _MONITORED_CODES
+
+
+# ---------------------------------------------------------------------------
+# Probe execution. Identical semantics to the previous implementation —
+# this is the only place where probe code actually runs.
+# ---------------------------------------------------------------------------
 
 
 def _run_probes(
@@ -85,20 +153,6 @@ def _run_probes(
     retval: Any = None,
     exception: Optional[BaseException] = None,
 ) -> int:
-    """Execute the given probes against ``frame``.
-
-    Returns the number of probes attempted (per ``cltrace`` semantics —
-    the self-uninstall check on the wrapper is what cares about the count;
-    the wrapper here treats the value as informational).
-
-    Errors from individual probes are logged and swallowed: nothing on
-    the probe path may disrupt user code.
-
-    In Phase 1 this function is never called with non-empty ``probes``
-    because ``_PROBE_INDEX`` is empty. The signature matches the spec
-    exactly so Phase 2 can fill the registry and start firing probes
-    without further changes here.
-    """
     for program, probe in probes:
         try:
             req_store = get_store()
@@ -129,334 +183,216 @@ def _run_probes(
     return len(probes)
 
 
-class InstrumentationDecorator:
+# ---------------------------------------------------------------------------
+# sys.monitoring callbacks.
+#
+# PEP 669 invokes these synchronously from inside the user code's frame, so
+# ``sys._getframe(1)`` reaches the user frame (``_getframe(0)`` is the
+# callback's own frame). We deliberately do not return
+# ``sys.monitoring.DISABLE`` from any callback — probes can come and go at
+# any time and we want the events to keep arriving until ``_apply_monitoring``
+# explicitly disables them via ``set_local_events``.
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_entry(code: CodeType) -> None:
+    probes = _CODE_PROBE_INDEX.get((code, "entry"), ())
+    if not probes:
+        return
+    try:
+        frame = sys._getframe(2)  # caller -> _on_py_start -> _dispatch_entry
+    except ValueError:
+        return
+    _run_probes(probes, frame)
+
+
+def _dispatch_exit(
+    code: CodeType,
+    *,
+    retval: Any = None,
+    exception: Optional[BaseException] = None,
+) -> None:
+    probes = _CODE_PROBE_INDEX.get((code, "exit"), ())
+    if not probes:
+        return
+    try:
+        frame = sys._getframe(2)
+    except ValueError:
+        return
+    _run_probes(probes, frame, retval=retval, exception=exception)
+
+
+def _on_py_start(code: CodeType, instruction_offset: int) -> Any:
+    _dispatch_entry(code)
+
+
+def _on_py_resume(code: CodeType, instruction_offset: int) -> Any:
+    _dispatch_entry(code)
+
+
+def _on_py_return(code: CodeType, instruction_offset: int, retval: Any) -> Any:
+    _dispatch_exit(code, retval=retval)
+
+
+def _on_py_yield(code: CodeType, instruction_offset: int, retval: Any) -> Any:
+    _dispatch_exit(code, retval=retval)
+
+
+def _on_py_unwind(
+    code: CodeType, instruction_offset: int, exception: BaseException
+) -> Any:
+    _dispatch_exit(code, exception=exception)
+
+
+def _on_line(code: CodeType, line_number: int) -> Any:
+    # Line probes are not implemented in v1 — the install path skips them
+    # with a warning and the LINE event mask never gets enabled. This
+    # callback exists only because ``register_callback`` requires one if
+    # the event is ever toggled; nothing should reach it.
+    return
+
+
+# ---------------------------------------------------------------------------
+# Tool-id lifecycle.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_tool_registered() -> None:
+    """Acquire a ``sys.monitoring`` slot and register every callback.
+
+    Must be called under ``_LOCK``. Idempotent across repeated calls and
+    across stop()/start() cycles — the slot is held for the lifetime of
+    the process, so subsequent calls just flip events back on.
+
+    Slot preference order: the ad-hoc slots (3, 4) first, then the
+    reserved slots (``DEBUGGER_ID``, ``COVERAGE_ID``, ``PROFILER_ID``,
+    ``OPTIMIZER_ID``) — see ``_TOOL_CANDIDATES`` for the canonical list.
+    Raises ``RuntimeError`` only when every candidate slot is owned by
+    some other tool; at that point we'd be fighting pdb / debugpy /
+    coverage / profiler over a slot and would rather fail loudly.
     """
-    InstrumentationDecorator enables dynamic entry/exit probes on functions.
+    global _TOOL_ID, _TOOL_REGISTERED, _CALLBACKS_REGISTERED
+    if _TOOL_REGISTERED:
+        return
 
-    Unlike standard decorators, this works on ALL references to a function, even those
-    created before instrumentation, by replacing the original function's bytecode with
-    a redirect to the decorator.
+    if _TOOL_ID == -1:
+        chosen: Optional[int] = None
+        for candidate in _TOOL_CANDIDATES:
+            owner = sys.monitoring.get_tool(candidate)
+            if owner is None:
+                sys.monitoring.use_tool_id(candidate, _TOOL_NAME)
+                chosen = candidate
+                break
+            if owner == _TOOL_NAME:
+                chosen = candidate
+                break
+        if chosen is None:
+            owners = [
+                (cand, sys.monitoring.get_tool(cand)) for cand in _TOOL_CANDIDATES
+            ]
+            raise RuntimeError(
+                "every candidate sys.monitoring tool slot is taken; "
+                f"refusing to install libdebugger probes (owners={owners})"
+            )
+        _TOOL_ID = chosen
 
-    Architecture:
+    if not _CALLBACKS_REGISTERED:
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_START, _on_py_start)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_RESUME, _on_py_resume)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_RETURN, _on_py_return)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_YIELD, _on_py_yield)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.PY_UNWIND, _on_py_unwind)
+        sys.monitoring.register_callback(_TOOL_ID, _EVENTS.LINE, _on_line)
+        _CALLBACKS_REGISTERED = True
 
-        func.__posthog_decorator = InstrumentationDecorator(func, qualname=...)
+    # PY_UNWIND is global-only — enable it for our tool id. The dispatch
+    # callback short-circuits on codes that aren't in ``_CODE_PROBE_INDEX``,
+    # so a permanently-global PY_UNWIND is effectively no-op when nothing
+    # is monitored.
+    sys.monitoring.set_events(_TOOL_ID, _GLOBAL_EVENT_MASK)
 
-        Before:                         After:
-        +-------------+                +-------------+
-        |   func()    |                |   func()    | (original reference)
-        |             |                |             |
-        |  original   |                |  redirect   |---+
-        |  bytecode   |                |  bytecode   |   |
-        +-------------+                +-------------+   |
-                                                         |
-       old_ref = func                  old_ref = func    | ALL references
-                                                         | redirect through
-                                                         | the decorator
-                                                         |
-                                                         v
-                                             +--------------------+
-                                             |    Decorator       |
-                                             |   __call__()       |
-                                             +--------------------+
-                                                         |
-                                                         | calls
-                                                         v
-                                             +--------------------+
-                                             |  instrumented_fn   |
-                                             |                    |
-                                             | original bytecode  |
-                                             | + entry probe call |
-                                             +--------------------+
+    _TOOL_REGISTERED = True
 
-    Flow:
-      1. Entry: ``instrumented_fn`` runs the bytecode-injected call to
-         ``_capture_caller_frame_and_run_entry_probes`` which captures
-         the running frame onto ``self.frames`` and runs entry probes.
-      2. Execution: original function body executes inside ``instrumented_fn``.
-      3. Exit: ``__call__``'s ``finally`` pops the captured frame and
-         runs exit probes against it.
 
-    The wrapper carries NO probe state. Every call looks the active probe
-    set up in the module-level ``_PROBE_INDEX``. Probe changes become
-    visible to the wrapper on the next call automatically.
+def _release_tool() -> None:
+    """Disable every active event but retain ownership of the tool slot.
+
+    Holding the slot for process lifetime avoids two problems: callback
+    re-registration churn across start/stop cycles, and a window where
+    another tool (pdb, coverage) can grab our slot between stop() and
+    the next install_program(). Callers that genuinely want to free the
+    slot — typically only the test harness — must call
+    ``sys.monitoring.free_tool_id(_TOOL_ID)`` themselves.
     """
+    global _TOOL_REGISTERED
+    if not _TOOL_REGISTERED:
+        return
 
-    # The wrapped function. After __init__ its __code__ is the redirector.
-    wrapped_fn: Final[Callable[..., Any]]
-
-    # Original code of the function so we can restore it during cleanup.
-    original_code: Final[CodeType]
-    # Code for the redirector function (mutated into wrapped_fn.__code__).
-    redirector_code: Final[CodeType]
-    # The body executable: a separate FunctionType over original_code with
-    # the entry-probe call injected. NEVER overlaps with wrapped_fn.
-    instrumented_fn: FunctionType
-
-    # Specifier this wrapper was created for; the registry key.
-    qualname: str
-
-    # Stack of frames captured by instrumented_fn at entry. Exit probes
-    # run against the top of this stack in __call__'s finally.
-    frames: List[FrameType]
-
-    # Tuple of line probes baked into instrumented_fn. Phase 1 always
-    # leaves this empty; Phase 2+ uses it for drift detection.
-    _installed_line_probes: Tuple[Any, ...]
-
-    # Per-wrapper lock serializing rebuild + cleanup against concurrent
-    # __call__s from other threads. Distinct from module-level _LOCK.
-    _lock: threading.Lock
-
-    def __init__(
-        self,
-        fn: Callable[..., Any],
-        qualname: str,
-    ) -> None:
-        # Bound methods: unwrap to the underlying function so the
-        # bytecode redirect lands on the class-level function object.
-        if inspect.ismethod(fn):
-            fn = fn.__func__  # type: ignore
-
-        self.qualname = qualname
-        self.original_code = fn.__code__
-        self.wrapped_fn = fn
-        self.frames = []
-        self._installed_line_probes = ()
-        self._lock = threading.Lock()
-
-        # Build instrumented_fn from the ORIGINAL code (pre-redirector
-        # mutation). Phase 1 always passes an empty line-probe tuple.
-        self.instrumented_fn = _build_instrumented(self, ())
-
-        self.redirector_code = self._generate_redirector_code()
-
-        # LAST step: mutate the user-visible function to the redirector.
-        # Must happen after instrumented_fn is built — otherwise the
-        # body-execution path would loop forever through the redirector.
-        self.wrapped_fn.__code__ = self.redirector_code
-
-    def __getattr__(self, name: str) -> Any:
-        """Forward attribute access to the underlying function.
-
-        Guarded against the (rare) case where ``__getattr__`` is invoked
-        before ``__init__`` finishes wiring ``wrapped_fn`` — otherwise
-        Python's ``hasattr()`` probes during construction recurse here.
-        """
-        if name == "wrapped_fn":
-            raise AttributeError(name)
-        return getattr(self.wrapped_fn, name)
-
-    def __del__(self):
-        """Restore original bytecode if the decorator is finalized."""
+    for code in list(_MONITORED_CODES):
         try:
-            self.cleanup()
+            sys.monitoring.set_local_events(_TOOL_ID, code, 0)
         except Exception:
-            # Finalizers must not raise; surface via logging only.
-            pass
+            logger.exception("failed disabling monitoring on %r during release", code)
+    _MONITORED_CODES.clear()
 
-    def cleanup(self):
-        """Restore wrapped_fn to its original bytecode. Idempotent."""
-        try:
-            self.wrapped_fn.__code__ = self.original_code
-        except Exception:
-            logger.exception("cleanup failed restoring code for %s", self.qualname)
+    try:
+        sys.monitoring.set_events(_TOOL_ID, 0)
+    except Exception:
+        logger.exception("failed disabling global events")
 
-    def _push_frame(self, frame: FrameType) -> None:
-        self.frames.append(frame)
-
-    def _pop_frame(self) -> Optional[FrameType]:
-        try:
-            return self.frames.pop()
-        except IndexError:
-            return None
-
-    def _peek_frame(self) -> Optional[FrameType]:
-        try:
-            return self.frames[-1]
-        except IndexError:
-            return None
-
-    def _generate_redirector_code(self) -> CodeType:
-        """Generate redirector bytecode that hops into the decorator."""
-        new_bc = redirector_code(self)
-        new_bc.name = self.original_code.co_name
-        new_bc.filename = self.original_code.co_filename
-        new_bc.first_lineno = self.original_code.co_firstlineno
-
-        # Preserve freevars / cellvars so __code__ assignment works for
-        # functions with closures. The redirector itself doesn't use them.
-        new_bc.freevars = list(self.original_code.co_freevars)
-        new_bc.cellvars = list(self.original_code.co_cellvars)
-
-        return new_bc.to_code()
-
-    def _capture_caller_frame_and_run_entry_probes(self) -> None:
-        """Called from inside ``instrumented_fn``'s first instruction.
-
-        Captures the running frame onto the wrapper's frame-stack so
-        exit probes can run against it later, then runs whatever entry
-        probes the module-level registry has for ``self.qualname``.
-
-        Wrapped in try/except — nothing on the probe path may disrupt
-        user code. Errors are logged and swallowed.
-        """
-        try:
-            caller_frame = sys._getframe(1)  # instrumented_fn's frame
-            self._push_frame(caller_frame)
-            entry = _PROBE_INDEX.get((self.qualname, "entry"), ())
-            _run_probes(entry, caller_frame)
-        except Exception:
-            logger.exception("entry-probe execution failed for %s", self.qualname)
-
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
-        # Line-probe drift check. In Phase 1 _PROBE_INDEX is empty so
-        # ``line`` is always ``()`` and self._installed_line_probes is
-        # also ``()`` — identity-compare passes and we skip the rebuild.
-        # In Phase 2+ this picks up live changes from the registry.
-        line = _PROBE_INDEX.get((self.qualname, "line"), ())
-        if line is not self._installed_line_probes:
-            with self._lock:
-                line = _PROBE_INDEX.get((self.qualname, "line"), ())
-                if line is not self._installed_line_probes:
-                    self.instrumented_fn = _build_instrumented(self, line)
-                    self._installed_line_probes = line
-
-        previous_frame_top = self._peek_frame()
-        exception: Optional[BaseException] = None
-        retval: Any = None
-
-        try:
-            retval = self.instrumented_fn(*args, **kwds)
-            return retval
-        except BaseException as e:
-            exception = e
-            raise
-        finally:
-            function_frame = self._pop_frame()
-            exit_ = _PROBE_INDEX.get((self.qualname, "exit"), ())
-
-            if function_frame is not None and function_frame is not previous_frame_top:
-                # instrumented_fn ran far enough to push its own frame.
-                _run_probes(
-                    exit_,
-                    function_frame,
-                    retval=retval,
-                    exception=exception,
-                )
-            elif function_frame is not None:
-                # We popped a frame that doesn't belong to this call —
-                # instrumented_fn crashed before its entry-probe injection
-                # ran. Restore the frame so its real owner can pop it.
-                self._push_frame(function_frame)
-
-            # Self-uninstall when the registry says nobody is home.
-            # In Phase 1 the registry is always empty, so this branch
-            # would fire on every call — but the wrapper only ever
-            # exists in Phase 1 tests where the test itself manages
-            # ``__posthog_decorator``. The ``delattr`` is wrapped in
-            # try/except so explicit test-driven setup doesn't crash on
-            # the lazy cleanup path.
-            #
-            # NOTE: We MUST use ``delattr(..., "__posthog_decorator")``
-            # rather than ``del self.wrapped_fn.__posthog_decorator``.
-            # Inside a class body Python applies name-mangling to dunder
-            # (double-underscore) prefixes — the attribute access would
-            # be rewritten to ``_InstrumentationDecorator__posthog_decorator``
-            # which never matches the attribute the caller set, and the
-            # ``except AttributeError`` would silently swallow the failure.
-            # The string literal escapes mangling.
-            #
-            # TODO(phase-7): revisit reentrancy under concurrent calls —
-            # the threaded-stress phase needs to validate that the
-            # registry-empty check + self.cleanup() + delattr sequence
-            # is safe when another thread is mid-``__call__`` on the
-            # same wrapper. The Phase 2 spec validates the locking under
-            # serial execution; Phase 7's job is the concurrent case.
-            entry_now = _PROBE_INDEX.get((self.qualname, "entry"), ())
-            if not entry_now and not exit_ and not self._installed_line_probes:
-                with self._lock:
-                    if not _any_probes_for(self.qualname):
-                        self.cleanup()
-                        try:
-                            delattr(self.wrapped_fn, "__posthog_decorator")
-                        except AttributeError:
-                            pass
+    _TOOL_REGISTERED = False
 
 
-def _build_instrumented(
-    decorator: "InstrumentationDecorator",
-    line_probes: Tuple[Any, ...],
-) -> FunctionType:
-    """Build a fresh ``FunctionType`` over ``decorator.original_code``
-    with the entry-probe-call bytecode injected at the first instruction.
+def _apply_monitoring(new_codes_to_kinds: Dict[CodeType, Set[str]]) -> None:
+    """Diff ``new_codes_to_kinds`` against ``_MONITORED_CODES`` and update.
 
-    Line probes are recognized but not woven in v1; a warning is logged
-    when any are passed. The rebuild slot exists so v2 can extend
-    ``injector`` to weave probe calls at each line probe's offset.
+    For each code that left the set: disable all events. For each code in
+    the new set: compute the event mask from the kinds present in the
+    probe index and call ``set_local_events`` to enable them. Line probes
+    are intentionally NOT supported by this path — the manager skips them
+    in the rebuild, so ``new_codes_to_kinds`` only carries ``entry`` /
+    ``exit`` kinds.
+
+    Called under ``_LOCK`` from ``_rebuild_probe_index``.
     """
-    injector = EntrypointInjector(
-        code_generator=generate_code_call_self_method(
-            decorator,
-            "_capture_caller_frame_and_run_entry_probes",
-        ),
-    )
-    code = injector.inject(decorator.original_code).to_code()
+    new_codes = set(new_codes_to_kinds)
+    old_codes = set(_MONITORED_CODES)
 
-    if line_probes:
-        logger.warning(
-            "Line probes deferred to v2; ignoring %d probe(s)", len(line_probes)
-        )
+    for code in old_codes - new_codes:
+        try:
+            sys.monitoring.set_local_events(_TOOL_ID, code, 0)
+        except Exception:
+            logger.exception("failed disabling monitoring on %r", code)
+        _MONITORED_CODES.pop(code, None)
 
-    fn = FunctionType(
-        code,
-        decorator.wrapped_fn.__globals__,
-        decorator.wrapped_fn.__name__,
-        decorator.wrapped_fn.__defaults__,
-        decorator.wrapped_fn.__closure__,
-    )
-
-    # Preserve metadata so ``instrumented_fn`` is indistinguishable from
-    # the original under introspection:
-    #
-    #   - ``__kwdefaults__``: kw-only default values; required for the
-    #     instrumented function to accept the same keyword-only args.
-    #   - ``__qualname__``: dotted name shown in tracebacks and reprs;
-    #     without it stack traces lose the class/qualified context.
-    #   - ``__module__``: used by logging/repr to locate where the
-    #     function was defined.
-    #   - ``__doc__``: preserved so ``help()`` and tooling that reads
-    #     docstrings keep working.
-    #   - ``__annotations__``: preserved so type-introspection tools
-    #     (``typing.get_type_hints``, IDEs) see the same annotations.
-    #   - ``__wrapped__``: pointed at ``wrapped_fn`` so ``inspect.unwrap()``
-    #     and any ``functools.wraps``-style introspection can walk back
-    #     to the original function object.
-    if hasattr(decorator.wrapped_fn, "__kwdefaults__"):
-        fn.__kwdefaults__ = decorator.wrapped_fn.__kwdefaults__
-    if hasattr(decorator.wrapped_fn, "__qualname__"):
-        fn.__qualname__ = decorator.wrapped_fn.__qualname__
-    if hasattr(decorator.wrapped_fn, "__module__"):
-        fn.__module__ = decorator.wrapped_fn.__module__
-    if hasattr(decorator.wrapped_fn, "__doc__"):
-        fn.__doc__ = decorator.wrapped_fn.__doc__
-    if hasattr(decorator.wrapped_fn, "__annotations__"):
-        fn.__annotations__ = decorator.wrapped_fn.__annotations__
-    fn.__wrapped__ = decorator.wrapped_fn  # type: ignore[attr-defined]
-    return fn
+    for code, kinds in new_codes_to_kinds.items():
+        mask = 0
+        if "entry" in kinds:
+            mask |= _ENTRY_EVENT_MASK
+        if "exit" in kinds:
+            mask |= _EXIT_EVENT_MASK
+        if mask == 0:
+            continue
+        if _MONITORED_CODES.get(code) == mask:
+            continue
+        try:
+            sys.monitoring.set_local_events(_TOOL_ID, code, mask)
+        except Exception:
+            logger.exception("failed enabling monitoring on %r", code)
+            continue
+        _MONITORED_CODES[code] = mask
 
 
-def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]):
-    """Forward a probe-capture payload to the registered event sink.
+# ---------------------------------------------------------------------------
+# Event sink (capture forwarding).
+# ---------------------------------------------------------------------------
 
-    No-op (with a debug log) if no sink is registered. The event name is
-    always ``$hogtrace_capture``; per-fire metadata (program / probe ids,
-    scope context, thread info, timestamp) is folded into the properties.
-    """
+
+def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]) -> None:
     sink = _EVENT_SINK
     if sink is None:
         logger.debug(
-            "no event sink registered; dropping capture from probe %s",
-            probe.id,
+            "no event sink registered; dropping capture from probe %s", probe.id
         )
         return
 
@@ -467,7 +403,6 @@ def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]):
         "context_id": scope.context_id if scope is not None else None,
         "probe_spec": serialize_probe_spec(probe.spec),
         "captures": captures,
-        # "$stack_trace": stacktrace,
         "timestamp": datetime.datetime.now(),
         "thread_id": threading.current_thread().ident,
         "thread_name": threading.current_thread().name,
@@ -476,10 +411,7 @@ def _enqueue_message(program: Program, probe: Probe, captures: Dict[str, Any]):
     try:
         sink("$hogtrace_capture", properties)
     except Exception:
-        logger.exception(
-            "event sink raised; dropping capture from probe %s",
-            probe.id,
-        )
+        logger.exception("event sink raised; dropping capture from probe %s", probe.id)
 
 
 def serialize_probe_spec(spec: ProbeSpec) -> Dict[str, str]:

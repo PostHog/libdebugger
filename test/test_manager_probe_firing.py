@@ -55,10 +55,10 @@ def test_entry_probe_fires_once_per_call(hogtrace_scope, capture_enqueue):
     )
     install_program(program)
 
-    # Sanity: registry populated, fn wrapped.
+    # Sanity: registry populated, fn instrumented.
     assert instr._INSTALLED_PROGRAMS["prog-entry"] is program
     assert ("test.target.fn_a", "entry") in instr._PROBE_INDEX
-    assert hasattr(target_mod.fn_a, "__posthog_decorator")
+    assert instr.is_instrumented(target_mod.fn_a)
 
     # Single call -> exactly one entry-probe enqueue.
     target_mod.fn_a(7)
@@ -183,8 +183,14 @@ def test_multiple_programs_on_same_function(hogtrace_scope, capture_enqueue):
     assert program_ids == {"prog-a", "prog-b"}
 
 
-def test_install_program_creates_wrapper_only_once(hogtrace_scope, capture_enqueue):
-    """Installing two programs targeting the same fn shares one wrapper instance."""
+def test_install_program_keeps_function_instrumented_across_installs(
+    hogtrace_scope, capture_enqueue
+):
+    """Two programs targeting the same fn keep ``is_instrumented`` True throughout.
+
+    Each install merges into the dispatch index without disturbing the
+    monitoring mask on the target's code object.
+    """
     from libdebugger.manager import install_program
 
     prog1 = _build_program(
@@ -196,12 +202,16 @@ def test_install_program_creates_wrapper_only_once(hogtrace_scope, capture_enque
         program_id="prog-shared-2",
     )
     install_program(prog1)
-    dec_after_first = target_mod.fn_a.__posthog_decorator
-    install_program(prog2)
-    dec_after_second = target_mod.fn_a.__posthog_decorator
+    assert instr.is_instrumented(target_mod.fn_a)
+    monitored_after_first = instr._MONITORED_CODES.get(target_mod.fn_a.__code__)
 
-    assert dec_after_first is dec_after_second, (
-        "wrapper should be created on first install and reused on subsequent installs"
+    install_program(prog2)
+    assert instr.is_instrumented(target_mod.fn_a)
+    # Mask grew (exit added) but the code stays monitored without churn.
+    assert instr._MONITORED_CODES.get(target_mod.fn_a.__code__) is not None
+    assert (
+        instr._MONITORED_CODES[target_mod.fn_a.__code__] != monitored_after_first
+        or monitored_after_first is None
     )
 
 
@@ -264,30 +274,9 @@ def test_resolve_target_returns_none_for_module():
     assert resolve_target("test.target") is None
 
 
-def test_rebuild_probe_index_reuses_tuple_when_unchanged():
-    """When _rebuild_probe_index produces the same content, it reuses the prior tuple object.
-
-    This is load-bearing for Phase 6: the wrapper's hot path identity-compares
-    line-probe tuples to detect drift. If _rebuild_probe_index always builds
-    a new tuple even when content is unchanged, identity-compare fires on
-    every reconcile and we rebuild instrumented_fn unnecessarily.
-    """
-    from libdebugger.manager import install_program, _rebuild_probe_index
-
-    program = _build_program(
-        "fn:test.target.fn_a:entry { capture(x=1); }",
-        program_id="prog-stable",
-    )
-    install_program(program)
-
-    snapshot_a = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
-
-    # Rebuild from the same _INSTALLED_PROGRAMS state — contents unchanged.
-    with instr._LOCK:
-        _rebuild_probe_index()
-
-    snapshot_b = instr._PROBE_INDEX[("test.target.fn_a", "entry")]
-
-    assert snapshot_a is snapshot_b, (
-        "tuple objects must be reused when contents are unchanged"
-    )
+# The tuple-reuse drift-detection test that used to live here is gone —
+# the bytecode-rewriting wrapper that identity-compared probe tuples no
+# longer exists. The rebuild can (and does) build a fresh tuple every
+# time. ``test_manager_self_cleanup.py`` covers the invariant that
+# matters now: ``_PROBE_INDEX`` is a pure function of
+# ``_INSTALLED_PROGRAMS``.

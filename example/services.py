@@ -1,8 +1,9 @@
 """Domain logic for the Flask example.
 
 Functions here are the candidates that probes target. Kept deliberately
-plain so the qualnames (``example.services.get_user`` etc.) line up
-with what a hogtrace probe specifier would name.
+plain so the qualnames (``services.get_user`` etc., since the app runs
+with the example dir on ``sys.path`` and imports this module as
+``services``) line up with what a hogtrace probe specifier would name.
 """
 
 from __future__ import annotations

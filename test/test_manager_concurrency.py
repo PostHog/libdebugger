@@ -7,9 +7,11 @@ convergence), and 7 (behavior preservation) still hold. No
 ``RuntimeError: dictionary changed size during iteration`` or partial-
 state observations.
 
-These tests exercise the atomic-rebind + per-wrapper-lock discipline
-established in earlier phases. Production code changes here would be a
-sign that an earlier phase landed an unsafe pattern.
+These tests exercise the atomic-rebind discipline used by
+``_rebuild_probe_index``: writers serialize on ``_LOCK`` and whole-dict
+replace ``_PROBE_INDEX`` / ``_CODE_PROBE_INDEX``; the ``sys.monitoring``
+callbacks read lock-free. Production code changes here would be a sign
+that the rebuild path landed an unsafe pattern.
 
 A note on hogtrace request scope: ``hogtrace.context.new_context()`` is
 built on top of ``contextvars.ContextVar``. ``ContextVar`` lookups return
@@ -93,36 +95,12 @@ def _resolve_callable(specifier: str) -> Callable[..., Any] | None:
 
 
 def _drain_registry() -> None:
-    """Tear down everything: registry + any lingering wrappers."""
+    """Uninstall every installed program — that's the full cleanup now."""
     for pid in list(instr._INSTALLED_PROGRAMS):
         try:
             manager.uninstall_program(pid)
         except Exception:
             pass
-    # Tear down any wrapper still attached.
-    for _name, obj in list(vars(target_mod).items()):
-        if hasattr(obj, "__posthog_decorator"):
-            dec = getattr(obj, "__posthog_decorator")
-            try:
-                dec.cleanup()
-            except Exception:
-                pass
-            try:
-                delattr(obj, "__posthog_decorator")
-            except AttributeError:
-                pass
-        if isinstance(obj, type):
-            for _mname, mobj in list(vars(obj).items()):
-                if hasattr(mobj, "__posthog_decorator"):
-                    dec = getattr(mobj, "__posthog_decorator")
-                    try:
-                        dec.cleanup()
-                    except Exception:
-                        pass
-                    try:
-                        delattr(mobj, "__posthog_decorator")
-                    except AttributeError:
-                        pass
 
 
 @pytest.fixture
@@ -454,14 +432,12 @@ def test_concurrent_call_during_reconcile(fire_counter):
             "or hogtrace scope setup is wrong"
         )
 
-        # P4 convergence: after stopping the reconciler, drain and call once;
-        # the wrapper should be gone.
+        # P4 convergence: after stopping the reconciler and draining the
+        # registry, fn_a must no longer be instrumented. Cleanup is
+        # synchronous under sys.monitoring — no follow-up call needed.
         _drain_registry()
-        # One last call to trip the lazy self-cleanup path if it didn't
-        # already happen. After this, fn_a must be unwrapped.
-        target_mod.fn_a(7)
-        assert not hasattr(target_mod.fn_a, "__posthog_decorator"), (
-            "P4: after drain + call, fn_a wrapper must self-clean"
+        assert not instr.is_instrumented(target_mod.fn_a), (
+            "P4: after drain, fn_a must no longer be instrumented"
         )
     finally:
         stop_event.set()

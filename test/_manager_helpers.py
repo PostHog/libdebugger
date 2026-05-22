@@ -15,7 +15,6 @@ from hogtrace.vm import compile as ht_compile, package as ht_package
 
 import libdebugger.instrumentation as instr
 import libdebugger.manager as manager
-from libdebugger.instrumentation import InstrumentationDecorator
 from test.strategies import _SPECIFIER_POOL
 
 
@@ -74,16 +73,13 @@ TARGETS = [
 
 
 def _unwrap(fn: Callable[..., Any]) -> None:
-    """Tear down whatever ``__posthog_decorator`` the test set up."""
-    dec = getattr(fn, "__posthog_decorator", None)
-    if dec is not None:
-        try:
-            dec.cleanup()
-        finally:
-            try:
-                delattr(fn, "__posthog_decorator")
-            except AttributeError:
-                pass
+    """No-op kept for backwards compatibility with older test patterns.
+
+    The sys.monitoring dispatch path doesn't attach any per-function
+    state, so there's nothing to unwind here. The fixture call sites
+    were retained so test files that import ``_unwrap`` still resolve.
+    """
+    del fn
 
 
 # ---------------------------------------------------------------------------
@@ -102,45 +98,16 @@ def _build_program(source: str, program_id: str = "test-prog"):
 
 
 def _drain_registry() -> None:
-    """Tear down everything in the registry plus any lingering wrappers.
+    """Uninstall every installed program.
 
     Used as cross-round cleanup inside the stateful machine — Hypothesis
     runs many examples within a single pytest invocation and the
     ``reset_state`` fixture only fires between pytest test cases, not
-    between Hypothesis examples.
+    between Hypothesis examples. ``uninstall_program`` itself does the
+    full dispatch-index + monitoring cleanup for each program.
     """
     for pid in list(instr._INSTALLED_PROGRAMS):
-        # No broad except: uninstall_program is the function under test;
-        # swallowing exceptions here would hide real regressions.
         manager.uninstall_program(pid)
-
-    # Also tear down any wrapper still attached to a target function. The
-    # production code leaves these in place until next-call self-cleanup;
-    # we need them gone between rounds so a stale wrapper from round N
-    # doesn't pollute round N+1's invariant check.
-    for _name, obj in list(vars(target_mod).items()):
-        if hasattr(obj, "__posthog_decorator"):
-            dec = getattr(obj, "__posthog_decorator")
-            try:
-                dec.cleanup()
-            except Exception:
-                pass
-            try:
-                delattr(obj, "__posthog_decorator")
-            except AttributeError:
-                pass
-        if isinstance(obj, type):
-            for _mname, mobj in list(vars(obj).items()):
-                if hasattr(mobj, "__posthog_decorator"):
-                    dec = getattr(mobj, "__posthog_decorator")
-                    try:
-                        dec.cleanup()
-                    except Exception:
-                        pass
-                    try:
-                        delattr(mobj, "__posthog_decorator")
-                    except AttributeError:
-                        pass
 
 
 # Deterministic arg providers for each specifier in _SPECIFIER_POOL. Used by
@@ -179,20 +146,15 @@ def _resolve_target_or_none(specifier: str):
     """Resolve a specifier to its current live callable, or None.
 
     Used inside the stateful machine's call_function rule to look up the
-    function object whose ``__posthog_decorator`` attribute we want to
-    check after the call. We use manager.resolve_target so the lookup
-    semantics match production exactly.
+    function object passed to ``instr.is_instrumented`` for the
+    convergence check. ``manager.resolve_target`` matches production
+    semantics exactly.
     """
     return manager.resolve_target(specifier)
 
 
 def _any_qualname_probed_in_index(qualname: str) -> bool:
-    """True iff any entry/exit/line slot for ``qualname`` carries probes.
-
-    Mirrors instrumentation._any_probes_for but reads through the test's
-    own snapshot of _PROBE_INDEX so the assertion is independent of the
-    production helper under test.
-    """
+    """True iff any entry/exit/line slot for ``qualname`` carries probes."""
     index = instr._PROBE_INDEX
     return bool(
         index.get((qualname, "entry"))
@@ -238,6 +200,87 @@ def _normalize_from_programs(
     return {key: frozenset(pairs) for key, pairs in out.items()}
 
 
+def _normalized_code_probe_index() -> Dict[Tuple[Any, str], FrozenSet[Tuple[str, str]]]:
+    """Map each ``_CODE_PROBE_INDEX`` slot to a frozenset of ``(program.id, probe.id)``.
+
+    Mirror of ``_normalized_index`` for the code-keyed dispatch table.
+    """
+    return {
+        key: frozenset((p.id, pr.id) for p, pr in pairs)
+        for key, pairs in instr._CODE_PROBE_INDEX.items()
+    }
+
+
+def _resolve_specifier_to_code(specifier: str):
+    """Walk a specifier to the underlying ``CodeType`` via ``resolve_target``,
+    returning ``None`` if the specifier doesn't resolve or the resolved
+    callable has no ``__code__``.
+
+    Used by the code-keyed model-rebuild helpers so they match exactly what
+    ``_rebuild_probe_index`` does to populate the dispatch table.
+    """
+    import inspect as _inspect
+
+    fn = manager.resolve_target(specifier)
+    if fn is None:
+        return None
+    underlying = fn.__func__ if _inspect.ismethod(fn) else fn
+    return getattr(underlying, "__code__", None)
+
+
+def _expected_code_probe_index_from_programs(
+    programs: Iterable[Any],
+) -> Dict[Tuple[Any, str], FrozenSet[Tuple[str, str]]]:
+    """What ``_CODE_PROBE_INDEX`` should hold given an iterable of Programs.
+
+    Line probes and unresolvable specifiers are dropped — matching the
+    manager's rebuild filter — and aliased specifiers aggregate into the
+    same ``(code, kind)`` slot.
+    """
+    out: Dict[Tuple[Any, str], set] = {}
+    for program in programs:
+        for probe in program.probes:
+            target = probe.spec.target
+            if target == "line":
+                continue
+            code = _resolve_specifier_to_code(probe.spec.specifier)
+            if code is None:
+                continue
+            out.setdefault((code, target), set()).add((program.id, probe.id))
+    return {key: frozenset(pairs) for key, pairs in out.items()}
+
+
+def _expected_monitored_codes_from_programs(
+    programs: Iterable[Any],
+) -> Dict[Any, int]:
+    """What ``_MONITORED_CODES`` (code -> event mask) should hold for these programs.
+
+    Computes the entry/exit mask from the set of kinds present in the
+    derived code-probe index. Mirrors ``_apply_monitoring`` exactly.
+    """
+    kinds_by_code: Dict[Any, set] = {}
+    for program in programs:
+        for probe in program.probes:
+            target = probe.spec.target
+            if target == "line":
+                continue
+            code = _resolve_specifier_to_code(probe.spec.specifier)
+            if code is None:
+                continue
+            kinds_by_code.setdefault(code, set()).add(target)
+
+    expected: Dict[Any, int] = {}
+    for code, kinds in kinds_by_code.items():
+        mask = 0
+        if "entry" in kinds:
+            mask |= instr._ENTRY_EVENT_MASK
+        if "exit" in kinds:
+            mask |= instr._EXIT_EVENT_MASK
+        if mask:
+            expected[code] = mask
+    return expected
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 — recursion invocation counter.
 # ---------------------------------------------------------------------------
@@ -255,14 +298,16 @@ def _expected_fact_invocations(n: int) -> int:
 
 
 __all__ = [
-    "InstrumentationDecorator",
     "TARGETS",
     "_CALL_ARGS_BY_SPECIFIER",
     "_any_qualname_probed_in_index",
     "_build_program",
     "_drain_registry",
+    "_expected_code_probe_index_from_programs",
     "_expected_fact_invocations",
+    "_expected_monitored_codes_from_programs",
     "_normalize_from_programs",
+    "_normalized_code_probe_index",
     "_normalized_index",
     "_resolve_target_or_none",
     "_unwrap",

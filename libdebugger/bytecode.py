@@ -1,5 +1,13 @@
 """
-Bytecode manipulation utilities
+Bytecode manipulation utilities — retained for reference only.
+
+Earlier versions of libdebugger instrumented target functions by rewriting
+their ``__code__`` to a redirector that hopped into a per-target decorator.
+That entire path has been replaced by PEP 669 ``sys.monitoring`` events
+(see ``libdebugger/instrumentation.py``). Nothing in the runtime imports
+from this module anymore; it stays in the repo so the design history is
+inspectable and so any future probe needs that genuinely require bytecode
+mutation have a starting point.
 """
 
 import sys
