@@ -3,12 +3,12 @@ name = "libdebugger"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "bytecode>=0.17.0",
     "hogtrace",
     "jsonpickle>=4.1.1",
-    "posthoganalytics>=6.7.4",
+    "posthoganalytics==7.30.1",
 ]
 
 [dependency-groups]
