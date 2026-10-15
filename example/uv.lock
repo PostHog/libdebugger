@@ -234,7 +234,7 @@ requires-dist = [
     { name = "bytecode", specifier = ">=0.17.0" },
     { name = "hogtrace", git = "https://github.com/PostHog/hogtrace" },
     { name = "jsonpickle", specifier = ">=4.1.1" },
-    { name = "posthoganalytics", specifier = ">=6.7.4" },
+    { name = "posthoganalytics", specifier = "==7.30.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -340,7 +340,7 @@ wheels = [
 
 [[package]]
 name = "posthoganalytics"
-version = "7.14.2"
+version = "7.30.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "backoff" },
@@ -348,9 +348,9 @@ dependencies = [
     { name = "requests" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/25/5863825de45030065b5add0fd03e9c7371fa4508ac0b31267456d9af71cc/posthoganalytics-7.14.2.tar.gz", hash = "sha256:d31a5123cd4086d0ec4f4bf70a4c2ab0fd1e199c19a2865332d3b9662d9b63c4", size = 206278, upload-time = "2026-05-13T16:36:36.605Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ad/c5/01c59158b02c5d645bb3e351b82fc948174c05a1cd0cb21162f4d88fa28f/posthoganalytics-7.30.1.tar.gz", hash = "sha256:17ebed83ba253d5f92baba153b720642a00fdf6fee8bda95957c054c4ea98145", size = 386791, upload-time = "2026-07-27T14:19:39.927Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3c/eb/2d1501b759389174155d8a6225aa25ef71f7a3dcd2a753aba2092ad6e10d/posthoganalytics-7.14.2-py3-none-any.whl", hash = "sha256:629ec2ae2ff187e7ca310ca78060a4035d6fedd84b68f3163bd9eff21ac26140", size = 242591, upload-time = "2026-05-13T16:36:34.879Z" },
+    { url = "https://files.pythonhosted.org/packages/78/f3/a424e140dde29f3737ecd09d3f97d98a1888c05cf18cb918c9191e8f36e1/posthoganalytics-7.30.1-py3-none-any.whl", hash = "sha256:5a3517d204aebfd02c9af8e010c093f2461bce88ea1299b8cdc9419e3405112b", size = 462838, upload-time = "2026-07-27T14:19:38.143Z" },
 ]
 
 [[package]]
